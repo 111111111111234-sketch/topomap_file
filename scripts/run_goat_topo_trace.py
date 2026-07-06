@@ -138,20 +138,95 @@ def snapshot_perception(agent: ConfTopoGOATAgent) -> dict[str, Any]:
 
 
 def snapshot_topo(agent: ConfTopoGOATAgent) -> dict[str, Any]:
+    """Capture topological map with dual-layer structure: semantic + navigation layers."""
+    from conftopo.core.dynamic_topo_map import NodeType
+
+    def _display_label(node: Any) -> str:
+        label = str(getattr(node, "label", "") or "").strip()
+        attrs = getattr(node, "attributes", {}) or {}
+        node_type = getattr(node, "node_type", None)
+        if node_type == NodeType.ROOM:
+            room_probs = attrs.get("room_probs") or {}
+            if isinstance(room_probs, dict) and room_probs:
+                best_label = max(
+                    room_probs.items(),
+                    key=lambda item: float(item[1]) if item[1] is not None else 0.0,
+                )[0]
+                best_text = str(best_label).strip()
+                if best_text:
+                    return best_text
+        return label
+    
     topo = agent.topo_map
-    nodes = []
+    
+    # 结构层节点（语义知识：房间、物体、地标、传送点）
+    structure_nodes_list = []
+    try:
+        for node in topo.structure_layer.nodes():
+            structure_nodes_list.append({
+                "id": node.node_id,
+                "type": node.node_type.value if hasattr(node.node_type, "value") else str(node.node_type),
+                "position": np.asarray(node.position).round(4).tolist(),
+                "confidence": float(node.confidence),
+                "label": _display_label(node),
+                "raw_label": node.label,
+                "step_id": int(node.step_id),
+                "visit_count": int(node.visit_count),
+                "attributes": dict(node.attributes) if node.attributes else {},
+            })
+    except Exception as e:
+        # Fallback if structure_layer not fully initialized
+        structure_nodes_list = []
+    
+    # 导航层节点（可执行路径：waypoint、frontier、candidate、approach）
+    navigation_nodes_list = []
+    try:
+        for node in topo.navigation_layer.nodes():
+            navigation_nodes_list.append({
+                "id": node.node_id,
+                "type": node.node_type.value if hasattr(node.node_type, "value") else str(node.node_type),
+                "position": np.asarray(node.position).round(4).tolist(),
+                "confidence": float(node.confidence),
+                "step_id": int(node.step_id),
+                "visit_count": int(node.visit_count),
+                "attributes": dict(node.attributes) if node.attributes else {},
+            })
+    except Exception as e:
+        # Fallback if navigation_layer not fully initialized
+        navigation_nodes_list = []
+    
+    # 跨层链接（结构意图 → 导航目标的映射）
+    cross_layer_edges = []
+    try:
+        for u, v, data in topo.cross_layer.edges():
+            edge_type = data.get("edge_type", "")
+            if hasattr(edge_type, "value"):
+                edge_type = edge_type.value
+            cross_layer_edges.append({
+                "source": u,
+                "target": v,
+                "type": str(edge_type),
+                "relation": data.get("relation", ""),
+            })
+    except Exception as e:
+        cross_layer_edges = []
+    
+    # 完整图数据（保持向后兼容）
+    all_nodes = []
     for node in topo._nodes.values():
-        nodes.append({
+        all_nodes.append({
             "id": node.node_id,
-            "type": node.node_type.value,
+            "type": node.node_type.value if hasattr(node.node_type, "value") else str(node.node_type),
             "position": np.asarray(node.position).round(4).tolist(),
             "confidence": float(node.confidence),
-            "label": node.label,
+            "label": _display_label(node),
+            "raw_label": node.label,
             "step_id": int(node.step_id),
             "visit_count": int(node.visit_count),
-            "attributes": dict(node.attributes),
+            "attributes": dict(node.attributes) if node.attributes else {},
         })
-    edges = []
+    
+    all_edges = []
     for u, v, data in topo.graph.edges(data=True):
         edge_type = data.get("edge_type", "")
         if hasattr(edge_type, "value"):
@@ -160,8 +235,34 @@ def snapshot_topo(agent: ConfTopoGOATAgent) -> dict[str, Any]:
         for extra_key in ["distance_m", "traversability", "visited_count", "evidence", "directions", "description_type", "connected_rooms", "via_landmark", "passage_type", "confidence", "transitions"]:
             if extra_key in data:
                 edge_entry[extra_key] = data[extra_key]
-        edges.append(edge_entry)
-    return {"nodes": nodes, "edges": edges}
+        all_edges.append(edge_entry)
+    
+    # 层级统计
+    layers_summary = {
+        "structure_layer_nodes": len(structure_nodes_list),
+        "navigation_layer_nodes": len(navigation_nodes_list),
+        "cross_layer_links": len(cross_layer_edges),
+        "total_graph_nodes": len(all_nodes),
+        "total_graph_edges": len(all_edges),
+    }
+    
+    return {
+        "nodes": all_nodes,  # 向后兼容
+        "edges": all_edges,  # 向后兼容
+        "structure_layer": {
+            "nodes": structure_nodes_list,
+            "node_count": len(structure_nodes_list),
+        },
+        "navigation_layer": {
+            "nodes": navigation_nodes_list,
+            "node_count": len(navigation_nodes_list),
+        },
+        "cross_layer": {
+            "edges": cross_layer_edges,
+            "edge_count": len(cross_layer_edges),
+        },
+        "layers_summary": layers_summary,
+    }
 
 
 def landmark_names(raw) -> list[str]:

@@ -31,6 +31,10 @@ def _angular_diff(a: float, b: float) -> float:
     return (a - b + math.pi) % (2 * math.pi) - math.pi
 
 
+def _distance3d(a: Sequence[float], b: Sequence[float]) -> float:
+    return float(np.linalg.norm(np.asarray(a, dtype=np.float32) - np.asarray(b, dtype=np.float32)))
+
+
 def _tolist(value: Any) -> Any:
     if value is None:
         return None
@@ -72,8 +76,8 @@ class PathfinderExecutor:
 
     def __init__(
         self,
-        reach_radius: float = 0.35,
-        waypoint_radius: float = 0.25,
+        reach_radius: float = 0.40,
+        waypoint_radius: float = 0.40,
         turn_threshold: float = 0.25,
         max_geodesic_distance: float = 80.0,
     ):
@@ -119,8 +123,8 @@ class PathfinderExecutor:
 
         start_relative = world_to_relative(start_world, origin_world_arr)
 
-        planar_dist = float(np.linalg.norm((target_relative_arr - start_relative)[[0, 2]]))
-        if planar_dist <= self.reach_radius:
+        dist3d = _distance3d(target_relative_arr, start_relative)
+        if dist3d <= self.reach_radius:
             return ReachabilityProbe(
                 reachable=True,
                 geodesic_distance=0.0,
@@ -156,7 +160,7 @@ class PathfinderExecutor:
         min_step_radius = max(self.waypoint_radius, self.reach_radius)
         for point in probe.path_points_relative[1:]:
             arr = np.asarray(point, dtype=np.float32)
-            if float(np.linalg.norm((arr - current)[[0, 2]])) > min_step_radius:
+            if _distance3d(arr, current) > min_step_radius:
                 return arr
         return np.asarray(probe.path_points_relative[-1], dtype=np.float32)
 
@@ -165,7 +169,7 @@ class PathfinderExecutor:
         current_relative = world_to_relative(np.asarray(state.position, dtype=np.float32), origin_world)
         target = np.asarray(waypoint_relative, dtype=np.float32)
         delta = target - current_relative
-        if float(np.linalg.norm(delta[[0, 2]])) <= self.reach_radius:
+        if float(np.linalg.norm(delta)) <= self.reach_radius:
             return "target_reached"
         target_heading = math.atan2(-float(delta[0]), -float(delta[2]))
         heading = _quat_to_heading(state.rotation)
@@ -214,14 +218,23 @@ class PathfinderExecutor:
             if node is None:
                 skipped.append({"node_id": node_id, "score": float(score), "reason": "missing_node"})
                 continue
-            probe_pos = node.position
+            probe_node_id = node_id
+            probe_node = node
             if getattr(node, "node_type", None) is not None and node.node_type.value == "object":
-                approach = node.attributes.get("best_approach_position")
-                if approach is not None:
-                    probe_pos = np.asarray(approach, dtype=np.float32)
-            probe = self.probe(sim, probe_pos, origin_world, target_node_id=node_id)
+                resolved = topo_map.navigation_target_for_structure_node(node_id)
+                if resolved is None or getattr(resolved, "node_type", None).value == "object":
+                    skipped.append({"node_id": node_id, "score": float(score), "reason": "object_without_navigation_anchor"})
+                    continue
+                probe_node = resolved
+                probe_node_id = resolved.node_id
+            probe = self.probe(sim, probe_node.position, origin_world, target_node_id=probe_node_id)
             row = probe.to_dict()
-            row.update({"node_id": node_id, "score": float(score), "type": node.node_type.value})
+            row.update({
+                "node_id": probe_node_id,
+                "source_node_id": node_id,
+                "score": float(score),
+                "type": probe_node.node_type.value,
+            })
             if probe.reachable:
                 reachable.append(row)
             else:
@@ -241,7 +254,7 @@ class CollisionLikeTracker:
 
     def update(self, previous_action: Optional[str], current_position_relative: Sequence[float]) -> Dict[str, Any]:
         pos = np.asarray(current_position_relative, dtype=np.float32)
-        movement = None if self._last_position is None else float(np.linalg.norm((pos - self._last_position)[[0, 2]]))
+        movement = None if self._last_position is None else float(np.linalg.norm(pos - self._last_position))
         if previous_action == "move_forward" and movement is not None and movement < self.move_epsilon:
             self.stuck_steps += 1
         else:

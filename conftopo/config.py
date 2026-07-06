@@ -92,6 +92,10 @@ class PerceptionConfig:
     vlm_api_base: str = "http://localhost:8000/v1"
     vlm_model: str = "Qwen/Qwen3-VL-8B-Instruct"
     vlm_timeout: float = 5.0
+    # Decoding controls. temperature=0.0 + a fixed seed give greedy,
+    # reproducible VLM outputs for deterministic regression baselines.
+    vlm_temperature: float = 0.1
+    vlm_seed: Optional[int] = None
 
 
 @dataclass

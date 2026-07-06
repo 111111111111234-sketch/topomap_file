@@ -54,7 +54,10 @@ class VLMBackendBase(ABC):
                 "stop_candidate": bool,
                 "recommended_action": str,
                 "goal_reason": str,
-                "portals": [str, ...],
+                "portals": [
+                    {"type": str, "state": str, "bearing": str, "traversable": bool},
+                    ...
+                ],
                 "scene_summary": str,
                 "uncertainty": float,
             }
@@ -122,12 +125,16 @@ class Qwen3VLBackend(VLMBackendBase):
         api_base: str = "http://localhost:8000/v1",
         model: str = "Qwen/Qwen3-VL-8B-Instruct",
         timeout: float = 5.0,
-        max_tokens: int = 1024,
+        max_tokens: int = 1536,
+        temperature: float = 0.1,
+        seed: Optional[int] = None,
     ):
         self._api_base = api_base
         self._model = model
         self._timeout = timeout
         self._max_tokens = max_tokens
+        self._temperature = float(temperature)
+        self._seed = seed
         self.supports_multi_image = False
         self._client: Any = None
 
@@ -200,18 +207,31 @@ class Qwen3VLBackend(VLMBackendBase):
 
     def _query_single_image_raw(self, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Execute a single VLM query and return the parsed JSON response."""
+        query_ok = True
+        error = ""
         try:
-            response = self._client.chat.completions.create(
-                model=self._model,
-                messages=messages,
-                max_tokens=self._max_tokens,
-                temperature=0.1,
-            )
+            create_kwargs: Dict[str, Any] = {
+                "model": self._model,
+                "messages": messages,
+                "max_tokens": self._max_tokens,
+                "temperature": self._temperature,
+            }
+            if self._seed is not None:
+                create_kwargs["seed"] = int(self._seed)
+            response = self._client.chat.completions.create(**create_kwargs)
             raw_text = response.choices[0].message.content or ""
         except Exception as exc:
             logger.warning("VLM query failed: %s", exc)
+            query_ok = False
+            error = str(exc)
             raw_text = ""
-        return parse_vlm_json(raw_text)
+        parsed = parse_vlm_json(raw_text)
+        parsed["_query_ok"] = query_ok
+        if error:
+            parsed["_error"] = error
+        parsed["_raw_text"] = raw_text
+        parsed["_raw_text_truncated"] = raw_text[:2000]
+        return parsed
 
     def _query_single_image(
         self,

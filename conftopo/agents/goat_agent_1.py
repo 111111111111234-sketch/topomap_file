@@ -1,136 +1,106 @@
-"""Single GOAT agent with an explicit perception-memory-planning loop.
+"""Clean Agent1 implementation for GOAT smoke experiments.
 
-This file is intentionally a clean first pass.  It keeps GOAT as one agent,
-but separates the internal responsibilities so the step loop reads like the
-method description:
+This agent follows the project proposal directly:
 
-observe -> CLIP -> optional VLM -> memory -> proposals -> planner -> state machine.
+perception -> memory update -> structure intent -> navigation target -> control.
+
+The agent keeps the public ``ConfTopoGOATAgent`` entrypoint used by
+``scripts/run_goat_agent1_smoke_v2.py`` but replaces the old mixed planning
+flow with explicit structure and navigation stages.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from enum import Enum
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 
 from conftopo.agents.base_agent import ConfTopoBaseAgent
+from conftopo.agents.goat_agent1_active_topo import ActiveTopoProjector
+from conftopo.agents.goat_agent1_control import StateMachine
+from conftopo.agents.goat_agent1_memory import Agent1MemoryWriter
+from conftopo.agents.goat_agent1_planner import NavigationPlanner, StructurePlanner
+from conftopo.agents.goat_agent1_types import (
+    ActiveTopoView,
+    AgentPose,
+    MapAuditContext,
+    NavigationHistoryEntry,
+    NavigationTarget,
+    PlanningContext,
+    ProjectionConfig,
+    RecoveryState,
+    ScanContext,
+)
 from conftopo.config import ConfTopoConfig
-from conftopo.core.dynamic_topo_map import DynamicTopoMap, EdgeType, NodeType, SemanticNode
-from conftopo.core.instruction_graph import GoalNode, GoalProposal, InstructionGraph
+from conftopo.core.dynamic_topo_map import NodeType
+from conftopo.core.instruction_graph import GoalNode, InstructionGraph
+from conftopo.navigation.pathfinder_executor import PathfinderExecutor
 from conftopo.perception.light_perceiver import LightPerceiver
 from conftopo.perception.perception_report import PerceptionReport
 from conftopo.perception.vlm_backend import Qwen3VLBackend
 from conftopo.perception.vlm_perceiver import VLMPerceiver
 
 
-class GOATState(str, Enum):
-    SEARCH = "SEARCH"
-    TRACK = "TRACK"
-    APPROACH = "APPROACH"
-    VERIFY_STOP = "VERIFY_STOP"
-    STOP = "STOP"
+NAV_REACH_RADIUS = 0.40
 
 
-@dataclass
-class AgentPose:
-    position: np.ndarray
-    heading: float = 0.0
+def _normalize_embedding(value: Any) -> Optional[np.ndarray]:
+    if value is None:
+        return None
+    arr = np.asarray(value, dtype=np.float32)
+    if arr.ndim > 1:
+        arr = arr.reshape(-1)
+    norm = float(np.linalg.norm(arr))
+    if norm < 1e-8:
+        return None
+    return (arr / norm).astype(np.float32)
 
 
-@dataclass
-class ClipHint:
-    room_label: str = "unknown"
-    room_confidence: float = 0.0
-    goal_scores: List[Any] = field(default_factory=list)
-    landmark_scores: List[Any] = field(default_factory=list)
-    best_goal_sim: float = 0.0
-    best_landmark_sim: float = 0.0
-    raw: Dict[str, Any] = field(default_factory=dict)
-
-    @property
-    def goal_candidate(self) -> bool:
-        return self.best_goal_sim >= 0.35
-
-
-@dataclass
-class NavigationTarget:
-    node_id: Optional[str]
-    position: Optional[np.ndarray]
-    target_type: str = "none"
-    proposal: Optional[GoalProposal] = None
-
-
-@dataclass
-class AgentState:
-    mode: GOATState = GOATState.SEARCH
-    transition_reason: str = "init"
-    verify_hits: int = 0
-    verify_attempts: int = 0
-    verify_cooldown_until_step: int = -1
-    verify_window: List[bool] = field(default_factory=list)
-    target_visible_window: List[bool] = field(default_factory=list)
-    target_area_window: List[float] = field(default_factory=list)
-    verify_area_window: List[float] = field(default_factory=list)
-    target_area_trend: float = 0.0
-    track_hits: int = 0
-    target_lost_steps: int = 0
-    state_steps: int = 0
-    last_goal_seen_step: int = -1
-    active_object_node_id: Optional[str] = None
-    stuck_steps: int = 0
-    stuck_recoveries: int = 0
-    stuck_target_node_id: Optional[str] = None
-    last_motion_delta: float = 0.0
-    last_stuck_reason: str = ""
-
-
-@dataclass
-class Hypothesis:
-    hypothesis_id: str
-    label: str
-    kind: str
-    confidence: float
-    position: np.ndarray
-    anchor_waypoint_id: Optional[str]
-    source: str
-    first_seen_step: int
-    last_seen_step: int
-    seen_count: int = 1
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-    def decayed_confidence(self, current_step: int, decay: float) -> float:
-        age = max(0, current_step - self.last_seen_step)
-        return float(self.confidence * (decay ** age))
-
-
-@dataclass
-class ObjectMemoryEntry:
-    object_id: str
-    node_id: str
-    label: str
-    confidence: float
-    attributes: Dict[str, Any]
-    bbox_history: List[Any]
-    anchor_waypoint_id: str
-    anchor_waypoint_position: np.ndarray
-    estimated_object_position: np.ndarray
-    observed_from: List[np.ndarray]
-    first_seen_step: int
-    last_seen_step: int
-    seen_count: int = 1
-    failed_count: int = 0
-    unreachable_count: int = 0
-
-    @property
-    def latest_bbox(self) -> Any:
-        return self.bbox_history[-1] if self.bbox_history else None
+def _crop_rgb_bbox(rgb: np.ndarray, bbox: Any, *, pad: float = 0.03) -> Optional[np.ndarray]:
+    if rgb is None or not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return None
+    arr = np.asarray(rgb)
+    if arr.ndim != 3 or arr.shape[0] <= 0 or arr.shape[1] <= 0:
+        return None
+    try:
+        x1, y1, x2, y2 = [float(v) for v in bbox]
+    except (TypeError, ValueError):
+        return None
+    if x2 < x1:
+        x1, x2 = x2, x1
+    if y2 < y1:
+        y1, y2 = y2, y1
+    height, width = int(arr.shape[0]), int(arr.shape[1])
+    max_coord = max(abs(x1), abs(y1), abs(x2), abs(y2))
+    if max_coord <= 1.5:
+        px1, px2 = x1 * width, x2 * width
+        py1, py2 = y1 * height, y2 * height
+        pad_x = pad * width
+        pad_y = pad * height
+    else:
+        px1, px2 = x1, x2
+        py1, py2 = y1, y2
+        pad_x = pad * max(width, 1)
+        pad_y = pad * max(height, 1)
+    if px2 - px1 < 4 or py2 - py1 < 4:
+        return None
+    if (px2 - px1) * (py2 - py1) < max(16, int(0.0001 * width * height)):
+        return None
+    ix1 = int(np.floor(max(0.0, px1 - pad_x)))
+    iy1 = int(np.floor(max(0.0, py1 - pad_y)))
+    ix2 = int(np.ceil(min(float(width), px2 + pad_x)))
+    iy2 = int(np.ceil(min(float(height), py2 + pad_y)))
+    if ix2 - ix1 < 4 or iy2 - iy1 < 4:
+        return None
+    if (ix2 - ix1) * (iy2 - iy1) < max(16, int(0.0001 * width * height)):
+        return None
+    crop = arr[iy1:iy2, ix1:ix2]
+    if crop.size <= 0:
+        return None
+    return crop
 
 
 class GoalManager:
-    """Owns the current GOAT goal and GoalGraph bridge."""
-
     def __init__(self, agent: "GOATAgent"):
         self.agent = agent
 
@@ -150,12 +120,13 @@ class GoalManager:
             self.agent.instruction_graph.set_current_goal(goal)
 
 
-class PerceptionModule:
-    """Light CLIP every step, VLM only when useful."""
+class Agent1Perception:
+    """CLIP every step, VLM only when triggered."""
 
     def __init__(self, config: ConfTopoConfig):
         self.config = config
         self.clip = LightPerceiver(room_labels=config.perception.room_labels)
+        self._clip_encoder = None
         self.vlm: Optional[VLMPerceiver] = None
         if config.perception.backend == "vlm":
             self.vlm = VLMPerceiver(
@@ -163,12 +134,27 @@ class PerceptionModule:
                     api_base=config.perception.vlm_api_base,
                     model=config.perception.vlm_model,
                     timeout=config.perception.vlm_timeout,
+                    temperature=config.perception.vlm_temperature,
+                    seed=config.perception.vlm_seed,
                 )
             )
-        self.last_vlm_step: int = -1
-        self.last_vlm_reason: str = ""
+        self.last_vlm_step = -1
+        self.last_vlm_reason = "init"
 
-    def configure_goal(self, goal: GoalNode) -> None:
+    def set_clip_encoder(self, encoder: Any) -> None:
+        self._clip_encoder = encoder
+
+    def configure_goal(self, goal: Optional[GoalNode]) -> None:
+        if goal is None:
+            return
+        if goal.target_embedding is None and self._clip_encoder is not None:
+            try:
+                embeds = self._clip_encoder.encode_text([goal.target_object])
+                if embeds is not None and len(embeds) > 0:
+                    goal.target_embedding = _normalize_embedding(np.asarray(embeds[0], dtype=np.float32))
+                    goal.embedding_source = "runtime_clip_text"
+            except Exception:
+                pass
         self.clip.set_goal_labels(
             labels=[goal.target_object],
             embeddings=(
@@ -181,2169 +167,1193 @@ class PerceptionModule:
             self.clip.set_landmark_labels(
                 labels=goal.landmarks,
                 embeddings=goal.landmark_embeddings,
-            )
-
-    def run_clip(self, rgb_embed: Optional[np.ndarray], goal: Optional[GoalNode]) -> ClipHint:
-        if rgb_embed is None:
-            return ClipHint()
-        report = self.clip.perceive(rgb_embed)
-        return ClipHint(
-            room_label=str(report.get("room_label", "unknown")),
-            room_confidence=float(report.get("room_confidence", 0.0)),
-            goal_scores=list(report.get("goal_scores", [])),
-            landmark_scores=list(report.get("landmark_scores", [])),
-            best_goal_sim=float(report.get("best_goal_sim", 0.0)),
-            best_landmark_sim=float(report.get("best_landmark_sim", 0.0)),
-            raw=report,
         )
 
-    def should_trigger_vlm(
+    def encode_object_crop(self, rgb: Optional[np.ndarray], bbox: Any) -> Optional[np.ndarray]:
+        if self._clip_encoder is None or rgb is None:
+            return None
+        crop = _crop_rgb_bbox(rgb, bbox)
+        if crop is None:
+            return None
+        try:
+            emb = self._clip_encoder.encode_image(crop, goal_type="category")
+        except TypeError:
+            try:
+                emb = self._clip_encoder.encode_image(crop)
+            except Exception:
+                return None
+        except Exception:
+            return None
+        return _normalize_embedding(emb)
+
+    def encode_object_text(self, label: str, description: str = "") -> Optional[np.ndarray]:
+        if self._clip_encoder is None:
+            return None
+        text = " ".join(part for part in (str(label or "").strip(), str(description or "").strip()) if part)
+        if not text:
+            return None
+        try:
+            embeds = self._clip_encoder.encode_text([text])
+        except Exception:
+            return None
+        if embeds is None or len(embeds) <= 0:
+            return None
+        return _normalize_embedding(np.asarray(embeds[0], dtype=np.float32))
+
+    def run_clip(
+        self,
+        rgb_embed: Optional[np.ndarray],
+        *,
+        step_id: int,
+    ) -> PerceptionReport:
+        if rgb_embed is None:
+            return PerceptionReport(step_id=step_id, source="none")
+        raw = self.clip.perceive(rgb_embed)
+        return PerceptionReport(
+            room_label=str(raw.get("room_label", "unknown")),
+            room_confidence=float(raw.get("room_confidence", 0.0)),
+            room_scores=list(raw.get("room_scores", [])),
+            goal_scores=list(raw.get("goal_scores", [])),
+            landmark_scores=list(raw.get("landmark_scores", [])),
+            best_goal_sim=float(raw.get("best_goal_sim", 0.0)),
+            best_landmark_sim=float(raw.get("best_landmark_sim", 0.0)),
+            visual_embed=rgb_embed,
+            source="clip",
+            is_full=False,
+            step_id=step_id,
+            raw=raw,
+        )
+
+    def should_run_vlm(
         self,
         *,
-        clip_hint: ClipHint,
+        clip_report: PerceptionReport,
         goal: Optional[GoalNode],
-        state: AgentState,
+        state: str,
         step_id: int,
     ) -> bool:
         if self.vlm is None or goal is None:
             self.last_vlm_reason = "no_vlm"
             return False
-        if state.mode in (GOATState.TRACK, GOATState.APPROACH, GOATState.VERIFY_STOP):
+        if state == "CONFIRM":
             self.last_vlm_reason = "state_refresh"
-            return step_id - self.last_vlm_step >= 2
-        if clip_hint.goal_candidate:
+            return True
+        if clip_report.best_goal_sim >= 0.20:
             self.last_vlm_reason = "clip_goal_candidate"
             return True
-
-        if state.mode == GOATState.SEARCH:
-            if self.last_vlm_step < 0:
-                self.last_vlm_reason = "initial_search_scan"
-                return True
-
-            if step_id <= 30 and step_id - self.last_vlm_step >= 5:
-                self.last_vlm_reason = "early_search_scan"
-                return True
-
-            if step_id - self.last_vlm_step >= 8:
-                self.last_vlm_reason = "periodic_search"
-                return True
-
+        if self.last_vlm_step < 0:
+            self.last_vlm_reason = "initial_search_scan"
+            return True
+        interval = 2 if step_id <= 60 else 4
+        if step_id - self.last_vlm_step >= interval:
+            self.last_vlm_reason = "periodic_search"
+            return True
         self.last_vlm_reason = "skip"
         return False
 
     def run_vlm(
         self,
         rgb: Optional[np.ndarray],
-        goal: Optional[GoalNode],
         *,
+        goal: Optional[GoalNode],
+        clip_report: PerceptionReport,
+        state: str,
         step_id: int,
-        state: AgentState,
-        clip_hint: ClipHint,
-    ) -> Optional[Dict[str, Any]]:
+        scan_type: str = "",
+    ) -> Optional[PerceptionReport]:
         if self.vlm is None or rgb is None or goal is None:
             return None
-        goal_text = _goal_text(goal)
-        mode = "confirm" if state.mode != GOATState.SEARCH else "explore"
-        context = (
-            f"state={state.mode.value}; "
-            f"clip_room={clip_hint.room_label}; "
-            f"clip_goal_sim={clip_hint.best_goal_sim:.3f}"
+        confirm_scan_types = {"object_anchor", "hypothesis_anchor", "goal_visible_followup"}
+        mode = (
+            "confirm"
+            if state == "CONFIRM" or scan_type in confirm_scan_types
+            else "explore"
         )
+        alias_text = _goal_alias_text(goal)
+        context_parts = [
+            f"state={state}",
+            f"scan_type={scan_type or 'none'}",
+            f"room={clip_report.room_label}",
+            f"goal_sim={clip_report.best_goal_sim:.3f}",
+            f"target_aliases={alias_text}",
+        ]
+        if mode == "explore":
+            context_parts.append(
+                "Explore openly: report salient navigation-useful objects, "
+                "landmarks, fixtures, and portals, with the goal prioritized first."
+            )
+        else:
+            context_parts.append("Confirm only the target or its aliases; ignore unrelated objects.")
+        context = "; ".join(context_parts)
         try:
             report = self.vlm.perceive(
                 np.asarray(rgb),
-                goal_text,
+                _goal_text(goal),
+                visual_embed=clip_report.visual_embed,
                 step_id=step_id,
                 context=context,
                 mode=mode,
             )
         except Exception as exc:
-            return {
-                "fresh": False,
-                "step": step_id,
-                "mode": mode,
-                "trigger_reason": f"vlm_error:{type(exc).__name__}",
-                "goal_visible": False,
-                "stop_candidate": False,
-                "objects": [],
-                "error": str(exc),
-            }
-
+            self.last_vlm_step = step_id
+            return PerceptionReport(
+                source="vlm",
+                is_full=False,
+                step_id=step_id,
+                raw={"error": str(exc), "error_type": type(exc).__name__},
+            )
         self.last_vlm_step = step_id
-        return _vlm_report_to_dict(report, reason=self.last_vlm_reason, mode=mode)
-
-
-class HypothesisPool:
-    """Short-term weak evidence from CLIP or non-confirmed VLM observations."""
-
-    def __init__(
-        self,
-        *,
-        max_size: int = 30,
-        ttl_steps: int = 12,
-        merge_radius: float = 2.0,
-        decay: float = 0.85,
-        min_confidence: float = 0.12,
-    ):
-        self.max_size = max_size
-        self.ttl_steps = ttl_steps
-        self.merge_radius = merge_radius
-        self.decay = decay
-        self.min_confidence = min_confidence
-        self._items: Dict[str, Hypothesis] = {}
-        self._counter = 0
-
-    def clear(self) -> None:
-        self._items.clear()
-        self._counter = 0
-
-    def __len__(self) -> int:
-        return len(self._items)
-
-    def items(self) -> List[Hypothesis]:
-        return list(self._items.values())
-
-    def add_or_update(
-        self,
-        *,
-        label: str,
-        kind: str,
-        confidence: float,
-        pose: AgentPose,
-        anchor_waypoint_id: Optional[str],
-        source: str,
-        step_id: int,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> Optional[Hypothesis]:
-        label = str(label).strip()
-        if not label or confidence < self.min_confidence:
-            return None
-
-        matched = self._find_match(label, kind, pose.position)
-        if matched is not None:
-            old_weight = max(1, matched.seen_count)
-            new_conf = max(float(confidence), matched.decayed_confidence(step_id, self.decay))
-            matched.position = (
-                matched.position * old_weight + pose.position
-            ) / float(old_weight + 1)
-            repeat_bonus = min(0.2, 0.03 * matched.seen_count)
-            matched.confidence = min(1.0, new_conf + repeat_bonus)
-            matched.anchor_waypoint_id = anchor_waypoint_id or matched.anchor_waypoint_id
-            matched.source = source
-            matched.last_seen_step = step_id
-            matched.seen_count += 1
-            matched.metadata.update(metadata or {})
-            return matched
-
-        self._counter += 1
-        hypothesis = Hypothesis(
-            hypothesis_id=f"hyp_{self._counter}",
-            label=label,
-            kind=kind,
-            confidence=float(confidence),
-            position=pose.position.copy(),
-            anchor_waypoint_id=anchor_waypoint_id,
-            source=source,
-            first_seen_step=step_id,
-            last_seen_step=step_id,
-            metadata=dict(metadata or {}),
-        )
-        self._items[hypothesis.hypothesis_id] = hypothesis
-        self._trim(step_id)
-        return hypothesis
-
-    def decay_and_prune(self, current_step: int) -> None:
-        for hyp in self._items.values():
-            if current_step > hyp.last_seen_step:
-                hyp.confidence = float(hyp.confidence * self.decay)
-        self._trim(current_step)
-
-    def active_for_goal(
-        self,
-        goal: Optional[GoalNode],
-        current_step: int,
-    ) -> List[Hypothesis]:
-        if goal is None:
-            return []
-        goal_label = str(goal.target_object or "").lower().strip()
-        room_priors = {str(room).lower().strip() for room in goal.room_prior or []}
-        landmarks = {str(label).lower().strip() for label in goal.landmarks or []}
-        out = []
-        for hyp in self._items.values():
-            if current_step - hyp.last_seen_step > self.ttl_steps:
-                continue
-            if hyp.confidence < self.min_confidence:
-                continue
-            label = hyp.label.lower().strip()
-            if hyp.kind == "object" and label == goal_label:
-                out.append(hyp)
-            elif hyp.kind == "room" and label in room_priors:
-                out.append(hyp)
-            elif hyp.kind == "landmark" and label in landmarks:
-                out.append(hyp)
-        out.sort(key=lambda hyp: (hyp.confidence, hyp.seen_count), reverse=True)
-        return out
-
-    def suppress_confirmed(self, *, label: str, position: np.ndarray, step_id: int) -> None:
-        label_key = str(label).lower().strip()
-        for hyp_id, hyp in list(self._items.items()):
-            if hyp.kind != "object" or hyp.label.lower().strip() != label_key:
-                continue
-            if _distance(hyp.position, position) <= self.merge_radius * 1.5:
-                self._items.pop(hyp_id, None)
-        self._trim(step_id)
-
-    def to_debug(self, current_step: int) -> List[Dict[str, Any]]:
-        return [
-            {
-                "id": hyp.hypothesis_id,
-                "label": hyp.label,
-                "kind": hyp.kind,
-                "confidence": round(float(hyp.confidence), 4),
-                "age": int(current_step - hyp.last_seen_step),
-                "seen_count": hyp.seen_count,
-                "source": hyp.source,
-                "anchor_waypoint_id": hyp.anchor_waypoint_id,
-            }
-            for hyp in sorted(
-                self._items.values(),
-                key=lambda item: item.confidence,
-                reverse=True,
-            )[:8]
-        ]
-
-    def _find_match(
-        self,
-        label: str,
-        kind: str,
-        position: np.ndarray,
-    ) -> Optional[Hypothesis]:
-        label_key = label.lower().strip()
-        best: Optional[Hypothesis] = None
-        best_dist = float("inf")
-        for hyp in self._items.values():
-            if hyp.label.lower().strip() != label_key or hyp.kind != kind:
-                continue
-            dist = _distance(hyp.position, position)
-            if dist < self.merge_radius and dist < best_dist:
-                best = hyp
-                best_dist = dist
-        return best
-
-    def _trim(self, current_step: int) -> None:
-        stale_ids = [
-            hyp_id
-            for hyp_id, hyp in self._items.items()
-            if (
-                current_step - hyp.last_seen_step > self.ttl_steps
-                or hyp.confidence < self.min_confidence
-            )
-        ]
-        for hyp_id in stale_ids:
-            self._items.pop(hyp_id, None)
-
-        if len(self._items) <= self.max_size:
-            return
-        keep = sorted(
-            self._items.values(),
-            key=lambda hyp: (hyp.confidence, hyp.last_seen_step, hyp.seen_count),
-            reverse=True,
-        )[:self.max_size]
-        self._items = {hyp.hypothesis_id: hyp for hyp in keep}
-
-
-class ObjectMemoryPool:
-    """Confirmed object memory backed by OBJECT nodes in the TopoMap."""
-
-    def __init__(
-        self,
-        topo_map: DynamicTopoMap,
-        *,
-        merge_radius: float = 2.0,
-        max_bbox_history: int = 8,
-        max_observed_from: int = 8,
-    ):
-        self.topo_map = topo_map
-        self.merge_radius = merge_radius
-        self.max_bbox_history = max_bbox_history
-        self.max_observed_from = max_observed_from
-        self._entries: Dict[str, ObjectMemoryEntry] = {}
-
-    def clear_runtime(self) -> None:
-        """Keep long-term object entries across GOAT goals."""
-        return
-
-    def __len__(self) -> int:
-        return len(self._entries)
-
-    def entries(self) -> List[ObjectMemoryEntry]:
-        return list(self._entries.values())
-
-    def get(self, object_id: str) -> Optional[ObjectMemoryEntry]:
-        return self._entries.get(object_id)
-
-    def goal_entries(self, goal: Optional[GoalNode]) -> List[ObjectMemoryEntry]:
-        if goal is None:
-            return []
-        goal_label = str(goal.target_object or "").lower().strip()
-        out = [
-            entry
-            for entry in self._entries.values()
-            if entry.label.lower().strip() == goal_label
-        ]
-        out.sort(key=lambda entry: (entry.confidence, entry.seen_count), reverse=True)
-        return out
-
-    def upsert_confirmed(
-        self,
-        *,
-        label: str,
-        confidence: float,
-        obj: Dict[str, Any],
-        pose: AgentPose,
-        waypoint_id: str,
-    ) -> ObjectMemoryEntry:
-        estimated_position = _estimate_object_position(pose, obj)
-        node = self._find_matching_node(label, estimated_position)
-        if node is None:
-            node_id = self._create_object_node(
-                label,
-                confidence,
-                obj,
-                pose,
-                waypoint_id,
-                estimated_position,
-            )
-        else:
-            node_id = node.node_id
-            self._update_object_node(
-                node,
-                confidence,
-                obj,
-                pose,
-                waypoint_id,
-                estimated_position,
-            )
-
-        node = self.topo_map.get_node(node_id)
-        if node is None:
-            raise RuntimeError(f"missing object node after upsert: {node_id}")
-
-        entry = self._entries.get(node_id)
-        bbox = obj.get("bbox")
-        attrs = dict(obj)
-        if entry is None:
-            entry = ObjectMemoryEntry(
-                object_id=node_id,
-                node_id=node_id,
-                label=label,
-                confidence=float(node.confidence),
-                attributes=attrs,
-                bbox_history=[bbox] if bbox is not None else [],
-                anchor_waypoint_id=waypoint_id,
-                anchor_waypoint_position=pose.position.copy(),
-                estimated_object_position=node.position.copy(),
-                observed_from=[pose.position.copy()],
-                first_seen_step=self.topo_map.current_step,
-                last_seen_step=self.topo_map.current_step,
-            )
-            self._entries[node_id] = entry
-        else:
-            entry.confidence = float(node.confidence)
-            entry.attributes.update(attrs)
-            if bbox is not None:
-                entry.bbox_history.append(bbox)
-                entry.bbox_history = entry.bbox_history[-self.max_bbox_history:]
-            entry.anchor_waypoint_id = waypoint_id
-            entry.anchor_waypoint_position = pose.position.copy()
-            entry.estimated_object_position = node.position.copy()
-            entry.observed_from.append(pose.position.copy())
-            entry.observed_from = entry.observed_from[-self.max_observed_from:]
-            entry.last_seen_step = self.topo_map.current_step
-            entry.seen_count += 1
-
-        self._sync_node_from_entry(node, entry)
-        return entry
-
-    def mark_navigation_failed(
-        self,
-        object_id: str,
-        *,
-        unreachable: bool = False,
-    ) -> None:
-        entry = self._entries.get(object_id)
-        if entry is None:
-            return
-
-        entry.failed_count += 1
-        if unreachable:
-            entry.unreachable_count += 1
-        entry.attributes["failed_count"] = entry.failed_count
-        entry.attributes["unreachable_count"] = entry.unreachable_count
-
-        node = self.topo_map.get_node(entry.node_id)
-        if node is not None:
-            node.attributes["failed_count"] = entry.failed_count
-            node.attributes["unreachable_count"] = entry.unreachable_count
-            node.attributes["last_failed_step"] = self.topo_map.current_step
-            node.attributes["memory_state"] = (
-                "unreachable" if unreachable else "navigation_failed"
-            )
-
-    def to_debug(self) -> List[Dict[str, Any]]:
-        return [
-            {
-                "object_id": entry.object_id,
-                "label": entry.label,
-                "confidence": round(float(entry.confidence), 4),
-                "seen_count": entry.seen_count,
-                "anchor_waypoint_id": entry.anchor_waypoint_id,
-                "estimated_object_position": entry.estimated_object_position.tolist(),
-                "last_seen_step": entry.last_seen_step,
-                "latest_bbox": entry.latest_bbox,
-                "failed_count": entry.failed_count,
-                "unreachable_count": entry.unreachable_count,
-            }
-            for entry in sorted(
-                self._entries.values(),
-                key=lambda item: (item.confidence, item.seen_count),
-                reverse=True,
-            )[:8]
-        ]
-
-    def _find_matching_node(
-        self,
-        label: str,
-        position: np.ndarray,
-    ) -> Optional[SemanticNode]:
-        nearby = self.topo_map.find_nodes_within_radius(
-            position,
-            radius=self.merge_radius,
-            node_type=NodeType.OBJECT,
-        )
-        label_key = label.lower().strip()
-        best = None
-        best_dist = float("inf")
-        for node in nearby:
-            if node.attributes.get("semantic_role") != "object_anchor":
-                continue
-            if node.label.lower().strip() != label_key:
-                continue
-            dist = _distance(node.position, position)
-            if dist < best_dist:
-                best = node
-                best_dist = dist
-        return best
-
-    def _create_object_node(
-        self,
-        label: str,
-        confidence: float,
-        obj: Dict[str, Any],
-        pose: AgentPose,
-        waypoint_id: str,
-        estimated_position: np.ndarray,
-    ) -> str:
-        attrs = self._node_attrs(
-            confidence,
-            obj,
-            pose,
-            waypoint_id,
-            estimated_position,
-            seen_count=1,
-        )
-        node_id = self.topo_map.add_node(
-            NodeType.OBJECT,
-            position=estimated_position.copy(),
-            confidence=confidence,
-            label=label,
-            attributes=attrs,
-        )
-        self.topo_map.add_edge(waypoint_id, node_id, EdgeType.ANCHORED_TO)
-        return node_id
-
-    def _update_object_node(
-        self,
-        node: SemanticNode,
-        confidence: float,
-        obj: Dict[str, Any],
-        pose: AgentPose,
-        waypoint_id: str,
-        estimated_position: np.ndarray,
-    ) -> None:
-        seen_count = int(node.attributes.get("seen_count", 1)) + 1
-        repeat_bonus = min(0.15, 0.02 * seen_count)
-        old_weight = max(1, seen_count - 1)
-        node.position = (
-            node.position * old_weight + estimated_position
-        ) / float(old_weight + 1)
-        node.confidence = min(1.0, max(float(node.confidence), confidence) + repeat_bonus)
-        node.step_id = self.topo_map.current_step
-        node.attributes.update(
-            self._node_attrs(
-                confidence,
-                obj,
-                pose,
-                waypoint_id,
-                node.position,
-                seen_count=seen_count,
-            )
-        )
-
-    def _node_attrs(
-        self,
-        confidence: float,
-        obj: Dict[str, Any],
-        pose: AgentPose,
-        waypoint_id: str,
-        estimated_position: np.ndarray,
-        *,
-        seen_count: int,
-    ) -> Dict[str, Any]:
-        bbox = obj.get("bbox")
-        return {
-            "semantic_role": "object_anchor",
-            "memory_state": "confirmed",
-            "source": "vlm",
-            "confidence": float(confidence),
-            "bbox": bbox,
-            "bbox_history": [bbox] if bbox is not None else [],
-            "range_bin": obj.get("range_bin", "unknown"),
-            "visibility": obj.get("visibility", "unknown"),
-            "attributes": dict(obj),
-            "anchor_waypoint_id": waypoint_id,
-            "anchor_waypoint_position": pose.position.copy().tolist(),
-            "estimated_object_position": estimated_position.copy().tolist(),
-            "observed_from": pose.position.copy().tolist(),
-            "observed_from_history": [pose.position.copy().tolist()],
-            "last_seen_step": self.topo_map.current_step,
-            "seen_count": seen_count,
-            "failed_count": int(obj.get("failed_count", 0) or 0),
-            "unreachable_count": int(obj.get("unreachable_count", 0) or 0),
-        }
-
-    def _sync_node_from_entry(
-        self,
-        node: SemanticNode,
-        entry: ObjectMemoryEntry,
-    ) -> None:
-        node.attributes["bbox_history"] = list(entry.bbox_history)
-        node.attributes["observed_from_history"] = [
-            pos.tolist() for pos in entry.observed_from
-        ]
-        node.attributes["anchor_waypoint_id"] = entry.anchor_waypoint_id
-        node.attributes["anchor_waypoint_position"] = (
-            entry.anchor_waypoint_position.tolist()
-        )
-        node.attributes["estimated_object_position"] = (
-            entry.estimated_object_position.tolist()
-        )
-        node.attributes["seen_count"] = entry.seen_count
-        node.attributes["last_seen_step"] = entry.last_seen_step
-        node.attributes["failed_count"] = entry.failed_count
-        node.attributes["unreachable_count"] = entry.unreachable_count
-        node.attributes["memory_state"] = "confirmed"
-        node.position = entry.estimated_object_position.copy()
-        node.confidence = max(float(node.confidence), float(entry.confidence))
-
-
-class MemoryManager:
-    """Owns short-term hypotheses and the shared DynamicTopoMap."""
-
-    def __init__(self, topo_map: DynamicTopoMap, config: ConfTopoConfig):
-        self.topo_map = topo_map
-        self.config = config
-        self.hypothesis_pool = HypothesisPool()
-        self.object_memory_pool = ObjectMemoryPool(topo_map)
-        self.structure_layer: Dict[str, Any] = {}
-        self.navigation_layer: Dict[str, Any] = {}
-        self.current_waypoint_id: Optional[str] = None
-
-    def reset_runtime(self) -> None:
-        self.current_waypoint_id = None
-        self.hypothesis_pool.clear()
-        self.object_memory_pool.clear_runtime()
-
-    def mark_object_navigation_failed(
-        self,
-        object_id: str,
-        *,
-        unreachable: bool = False,
-    ) -> None:
-        self.object_memory_pool.mark_navigation_failed(
-            object_id,
-            unreachable=unreachable,
-        )
-
-    def mark_navigation_target_failed(
-        self,
-        node_id: Optional[str],
-        *,
-        target_type: str,
-        unreachable: bool = False,
-        reason: str = "navigation_failed",
-    ) -> bool:
-        if node_id is None:
-            return False
-
-        if target_type == "object":
-            self.mark_object_navigation_failed(node_id, unreachable=unreachable)
-            entry = self.object_memory_pool.get(node_id)
-            self.navigation_layer["last_failed_target"] = {
-                "node_id": node_id,
-                "target_type": target_type,
-                "failed_count": entry.failed_count if entry is not None else None,
-                "unreachable_count": (
-                    entry.unreachable_count if entry is not None else None
-                ),
-                "reason": reason,
-                "step": self.topo_map.current_step,
-            }
-            return True
-
-        node = self.topo_map.get_node(node_id)
-        if node is None:
-            return False
-
-        failed_count = int(node.attributes.get("failed_count", 0) or 0) + 1
-        unreachable_count = int(node.attributes.get("unreachable_count", 0) or 0)
-        if unreachable:
-            unreachable_count += 1
-
-        node.attributes["failed_count"] = failed_count
-        node.attributes["unreachable_count"] = unreachable_count
-        node.attributes["last_failed_step"] = self.topo_map.current_step
-        node.attributes["failure_reason"] = reason
-        node.confidence = max(0.05, float(node.confidence) * 0.5)
-
-        if target_type == "frontier":
-            node.attributes["blocked"] = True
-            node.attributes["consumed"] = True
-        else:
-            node.attributes["blocked"] = bool(unreachable)
-
-        self.navigation_layer["last_failed_target"] = {
-            "node_id": node_id,
-            "target_type": target_type,
-            "failed_count": failed_count,
-            "unreachable_count": unreachable_count,
-            "reason": reason,
-            "step": self.topo_map.current_step,
-        }
-        return True
-
-    def update_step_memory(
-        self,
-        *,
-        clip_hint: ClipHint,
-        vlm_report: Optional[Dict[str, Any]],
-        pose: AgentPose,
-        rgb_embed: Optional[np.ndarray],
-        goal: Optional[GoalNode],
-    ) -> None:
-        self.topo_map.step()
-        waypoint_id = self._add_or_update_waypoint(pose, rgb_embed)
-        self._update_room(clip_hint, pose, rgb_embed, waypoint_id)
-        self.update_hypothesis(clip_hint, pose, waypoint_id)
-        if vlm_report is not None:
-            self.update_weak_vlm_hypotheses(vlm_report, pose, goal, waypoint_id)
-        if vlm_report is not None:
-            self.update_confirmed_memory(vlm_report, pose, goal, waypoint_id)
-        self._generate_frontiers(pose, rgb_embed, waypoint_id)
-        self.hypothesis_pool.decay_and_prune(self.topo_map.current_step)
-        self.topo_map.decay_all_confidences()
-
-    def update_hypothesis(
-        self,
-        clip_hint: ClipHint,
-        pose: AgentPose,
-        waypoint_id: Optional[str],
-    ) -> None:
-        label = _best_label(clip_hint.goal_scores)
-        if label is not None and clip_hint.best_goal_sim >= 0.25:
-            self.hypothesis_pool.add_or_update(
-                label=label,
-                kind="object",
-                confidence=clip_hint.best_goal_sim,
-                pose=pose,
-                anchor_waypoint_id=waypoint_id,
-                source="clip_goal",
-                step_id=self.topo_map.current_step,
-                metadata={"scores": list(clip_hint.goal_scores[:3])},
-            )
-
-        room_label = str(clip_hint.room_label or "").strip()
-        if room_label and room_label != "unknown" and clip_hint.room_confidence >= 0.35:
-            self.hypothesis_pool.add_or_update(
-                label=room_label,
-                kind="room",
-                confidence=clip_hint.room_confidence,
-                pose=pose,
-                anchor_waypoint_id=waypoint_id,
-                source="clip_room",
-                step_id=self.topo_map.current_step,
-            )
-
-        landmark = _best_label(clip_hint.landmark_scores)
-        if landmark is not None and clip_hint.best_landmark_sim >= 0.25:
-            self.hypothesis_pool.add_or_update(
-                label=landmark,
-                kind="landmark",
-                confidence=clip_hint.best_landmark_sim,
-                pose=pose,
-                anchor_waypoint_id=waypoint_id,
-                source="clip_landmark",
-                step_id=self.topo_map.current_step,
-                metadata={"scores": list(clip_hint.landmark_scores[:3])},
-            )
-
-    def update_weak_vlm_hypotheses(
-        self,
-        vlm_report: Dict[str, Any],
-        pose: AgentPose,
-        goal: Optional[GoalNode],
-        waypoint_id: str,
-    ) -> None:
-        goal_label = str(getattr(goal, "target_object", "") or "").lower().strip()
-        confirmed_goal_visible = bool(vlm_report.get("goal_visible", False))
-        for obj in vlm_report.get("objects", []) or []:
-            label = str(obj.get("label", "")).strip()
-            if not label:
-                continue
-            if confirmed_goal_visible and label.lower().strip() == goal_label:
-                continue
-            self.hypothesis_pool.add_or_update(
-                label=label,
-                kind="object",
-                confidence=float(obj.get("confidence", 0.0) or 0.0),
-                pose=pose,
-                anchor_waypoint_id=waypoint_id,
-                source="weak_vlm",
-                step_id=self.topo_map.current_step,
-                metadata={
-                    "bbox": obj.get("bbox"),
-                    "range_bin": obj.get("range_bin", "unknown"),
-                    "visibility": obj.get("visibility", "unknown"),
-                },
-            )
-
-    def update_confirmed_memory(
-        self,
-        vlm_report: Dict[str, Any],
-        pose: AgentPose,
-        goal: Optional[GoalNode],
-        waypoint_id: str,
-    ) -> None:
-        if not bool(vlm_report.get("goal_visible", False)):
-            return
-        objects = vlm_report.get("objects", []) or []
-        goal_label = str(getattr(goal, "target_object", "") or "").lower().strip()
-        candidates = [
-            dict(obj)
-            for obj in objects
-            if str(obj.get("label", "")).lower().strip() == goal_label
-        ]
-        if not candidates:
-            return
-
-        best = max(candidates, key=lambda obj: float(obj.get("confidence", 0.0) or 0.0))
-        label = str(best.get("label") or getattr(goal, "target_object", "object"))
-        confidence = max(
-            float(best.get("confidence", 0.0) or 0.0),
-            float(vlm_report.get("goal_match_confidence", 0.0) or 0.0),
-            0.55,
-        )
-        entry = self.object_memory_pool.upsert_confirmed(
-            label=label,
-            confidence=confidence,
-            obj=best,
-            pose=pose,
-            waypoint_id=waypoint_id,
-        )
-        self.hypothesis_pool.suppress_confirmed(
-            label=label,
-            position=pose.position,
-            step_id=self.topo_map.current_step,
-        )
-        self.structure_layer["last_confirmed_object_id"] = entry.object_id
-
-    def _add_or_update_waypoint(
-        self,
-        pose: AgentPose,
-        rgb_embed: Optional[np.ndarray],
-    ) -> str:
-        nearest = self.topo_map.find_nearest_node(
-            pose.position,
-            node_type=NodeType.WAYPOINT_VISITED,
-        )
-        if nearest is not None and np.linalg.norm(nearest.position - pose.position) < 0.6:
-            nearest.visit_count += 1
-            nearest.confidence = min(1.0, nearest.confidence + 0.05)
-            nearest.step_id = self.topo_map.current_step
-            node_id = nearest.node_id
-        else:
-            node_id = self.topo_map.add_node(
-                NodeType.WAYPOINT_VISITED,
-                position=pose.position.copy(),
-                embedding=rgb_embed,
-                confidence=0.9,
-            )
-        if self.current_waypoint_id is not None and self.current_waypoint_id != node_id:
-            self.topo_map.add_edge(self.current_waypoint_id, node_id, EdgeType.NAVIGABLE)
-        self.current_waypoint_id = node_id
-        return node_id
-
-    def _update_room(
-        self,
-        clip_hint: ClipHint,
-        pose: AgentPose,
-        rgb_embed: Optional[np.ndarray],
-        waypoint_id: str,
-    ) -> None:
-        if clip_hint.room_label == "unknown" or clip_hint.room_confidence < 0.2:
-            return
-        waypoint = self.topo_map.get_node(waypoint_id)
-        if waypoint is not None:
-            waypoint.attributes["room_label"] = clip_hint.room_label
-            waypoint.attributes["room_confidence"] = clip_hint.room_confidence
-
-        nearby = self.topo_map.find_nodes_within_radius(
-            pose.position,
-            radius=5.0,
-            node_type=NodeType.ROOM,
-        )
-        room = next((node for node in nearby if node.label == clip_hint.room_label), None)
-        if room is None:
-            room_id = self.topo_map.add_node(
-                NodeType.ROOM,
-                position=pose.position.copy(),
-                embedding=rgb_embed,
-                confidence=clip_hint.room_confidence,
-                label=clip_hint.room_label,
-            )
-            self.topo_map.add_edge(waypoint_id, room_id, EdgeType.BELONGS_TO)
-        else:
-            room.confidence = max(room.confidence, clip_hint.room_confidence)
-            room.step_id = self.topo_map.current_step
-
-    def _generate_frontiers(
-        self,
-        pose: AgentPose,
-        rgb_embed: Optional[np.ndarray],
-        waypoint_id: str,
-    ) -> None:
-        for delta in (-0.7, 0.0, 0.7):
-            heading = pose.heading + delta
-            position = pose.position + np.array(
-                [-np.sin(heading) * 2.5, 0.0, -np.cos(heading) * 2.5],
-                dtype=np.float32,
-            )
-            nearest = self.topo_map.find_nearest_node(
-                position,
-                node_type=NodeType.WAYPOINT_FRONTIER,
-            )
-            if nearest is not None and np.linalg.norm(nearest.position - position) < 1.2:
-                continue
-            frontier_id = self.topo_map.add_node(
-                NodeType.WAYPOINT_FRONTIER,
-                position=position,
-                embedding=rgb_embed,
-                confidence=0.45,
-                attributes={"source": "frontier", "created_from": waypoint_id},
-            )
-            self.topo_map.add_edge(waypoint_id, frontier_id, EdgeType.NAVIGABLE)
-
-
-class ProposalBuilder:
-    """GoalGraph + TopoMap -> executable proposals over existing nodes."""
-
-    def __init__(self):
-        self.last_debug: Dict[str, Any] = {}
-
-    def build(
-        self,
-        *,
-        goal: Optional[GoalNode],
-        memory: MemoryManager,
-        pose: AgentPose,
-    ) -> List[GoalProposal]:
-        if goal is None:
-            self.last_debug = {
-                "proposal_count": 0,
-                "proposal_counts": {},
-                "top_proposals": [],
-            }
-            return []
-
-        goal_id = _goal_id(goal)
-        object_proposals = self._object_proposals(goal_id, goal, memory, pose)
-        has_confirmed_goal_object = bool(object_proposals)
-        room_proposals = self._room_proposals(goal_id, goal, memory, pose)
-        hypothesis_proposals = self._hypothesis_proposals(
-            goal_id,
-            goal,
-            memory,
-            pose,
-            suppress_goal_hypotheses=has_confirmed_goal_object,
-        )
-        frontier_proposals = self._frontier_proposals(goal_id, goal, memory, pose)
-
-        proposals = (
-            object_proposals
-            + room_proposals
-            + hypothesis_proposals
-            + frontier_proposals
-        )
-        proposals = self._deduplicate(proposals)
-        proposals.sort(key=lambda proposal: proposal.score, reverse=True)
-
-        self.last_debug = {
-            "proposal_count": len(proposals),
-            "proposal_counts": {
-                "object": len(object_proposals),
-                "room": len(room_proposals),
-                "hypothesis": len(hypothesis_proposals),
-                "frontier": len(frontier_proposals),
-                "deduplicated": len(proposals),
-            },
-            "top_proposals": [self._proposal_debug(p) for p in proposals[:6]],
-        }
-        return proposals
-
-    def _object_proposals(
-        self,
-        goal_id: str,
-        goal: GoalNode,
-        memory: MemoryManager,
-        pose: AgentPose,
-    ) -> List[GoalProposal]:
-        proposals: List[GoalProposal] = []
-        goal_label = str(goal.target_object).lower().strip()
-        for entry in memory.object_memory_pool.entries():
-            if entry.label.lower().strip() != goal_label:
-                continue
-            node = memory.topo_map.get_node(entry.node_id)
-            if node is None:
-                continue
-            target_position = np.asarray(
-                entry.estimated_object_position,
-                dtype=np.float32,
-            )
-            dist = _distance(pose.position, target_position)
-            task_score = self._task_score_object(goal, entry)
-            confidence = max(float(entry.confidence), float(node.confidence))
-            history = min(1.0, entry.seen_count / 5.0)
-            history_bonus = min(0.2, 0.03 * entry.seen_count)
-            failed_count = max(
-                int(entry.failed_count),
-                int(node.attributes.get("failed_count", 0) or 0),
-            )
-            unreachable_count = max(
-                int(entry.unreachable_count),
-                int(node.attributes.get("unreachable_count", 0) or 0),
-            )
-            risk_penalty = min(
-                1.0,
-                0.25 * failed_count + 0.75 * unreachable_count,
-            )
-            score = (
-                0.45 * task_score
-                + 0.35 * confidence
-                + 0.15 * history
-                - 0.05 * dist
-                - risk_penalty
-            )
-            risk_reason = (
-                f"; failed={failed_count}; unreachable={unreachable_count}"
-                if failed_count or unreachable_count
-                else ""
-            )
-            reason = (
-                f"confirmed_object:{entry.label}; "
-                f"task={task_score:.2f}; conf={confidence:.2f}; "
-                f"seen={entry.seen_count}; risk={risk_penalty:.2f}{risk_reason}"
-            )
-            proposals.append(
-                self._with_reason(GoalProposal(
-                    goal_id=goal_id,
-                    candidate_node_id=node.node_id,
-                    candidate_type="object",
-                    anchor_node_id=entry.anchor_waypoint_id,
-                    target_position=target_position,
-                    score=score,
-                    semantic_score=task_score,
-                    task_score=task_score,
-                    history_bonus=history_bonus,
-                    distance_cost=dist,
-                    reachability_score=max(0.0, 1.0 - risk_penalty),
-                    risk_penalty=risk_penalty,
-                    negative_evidence=float(failed_count + unreachable_count),
-                    source="object_memory",
-                    can_stop=True,
-                    requires_verification=True,
-                    evidence_refs=[entry.object_id],
-                ), reason)
-            )
-        return proposals
-
-    def _room_proposals(
-        self,
-        goal_id: str,
-        goal: GoalNode,
-        memory: MemoryManager,
-        pose: AgentPose,
-    ) -> List[GoalProposal]:
-        proposals: List[GoalProposal] = []
-        room_priors = {str(room).lower().strip() for room in goal.room_prior or []}
-        for node in memory.topo_map.get_nodes_by_type(NodeType.ROOM):
-            room_label = str(node.label).lower().strip()
-            if room_priors and room_label not in room_priors:
-                continue
-            dist = _distance(pose.position, node.position)
-            task_score = 1.0 if room_label in room_priors else 0.3
-            confidence = float(node.confidence)
-            score = 0.50 * task_score + 0.30 * confidence - 0.04 * dist
-            reason = (
-                f"room_prior:{room_label}; task={task_score:.2f}; "
-                f"conf={confidence:.2f}"
-            )
-            proposals.append(
-                self._with_reason(GoalProposal(
-                    goal_id=goal_id,
-                    candidate_node_id=node.node_id,
-                    candidate_type="room",
-                    target_position=node.position.copy(),
-                    score=score,
-                    room_score=task_score,
-                    task_score=task_score,
-                    distance_cost=dist,
-                    source="structure_layer",
-                    can_stop=False,
-                    requires_verification=False,
-                    evidence_refs=[node.node_id],
-                ), reason)
-            )
-        return proposals
-
-    def _hypothesis_proposals(
-        self,
-        goal_id: str,
-        goal: GoalNode,
-        memory: MemoryManager,
-        pose: AgentPose,
-        *,
-        suppress_goal_hypotheses: bool,
-    ) -> List[GoalProposal]:
-        if suppress_goal_hypotheses:
-            return []
-
-        proposals: List[GoalProposal] = []
-        for hyp in memory.hypothesis_pool.active_for_goal(
-            goal,
-            memory.topo_map.current_step,
-        ):
-            if hyp.anchor_waypoint_id is None:
-                continue
-            anchor = memory.topo_map.get_node(hyp.anchor_waypoint_id)
-            if anchor is None:
-                continue
-            dist = _distance(pose.position, anchor.position)
-            task_score = self._task_score_hypothesis(goal, hyp)
-            history = min(1.0, hyp.seen_count / 3.0)
-            history_bonus = min(0.15, 0.04 * hyp.seen_count)
-            score = (
-                0.45 * task_score
-                + 0.30 * hyp.confidence
-                + 0.10 * history
-                - 0.04 * dist
-            )
-            reason = (
-                f"weak_{hyp.kind}:{hyp.label}; task={task_score:.2f}; "
-                f"conf={hyp.confidence:.2f}; seen={hyp.seen_count}"
-            )
-            proposals.append(
-                self._with_reason(GoalProposal(
-                    goal_id=goal_id,
-                    candidate_node_id=anchor.node_id,
-                    candidate_type="hypothesis",
-                    anchor_node_id=anchor.node_id,
-                    target_position=anchor.position.copy(),
-                    score=score,
-                    semantic_score=task_score,
-                    task_score=task_score,
-                    history_bonus=history_bonus,
-                    distance_cost=dist,
-                    source="hypothesis_pool",
-                    can_stop=False,
-                    requires_verification=True,
-                    evidence_refs=[hyp.hypothesis_id],
-                ), reason)
-            )
-        return proposals
-
-    def _frontier_proposals(
-        self,
-        goal_id: str,
-        goal: GoalNode,
-        memory: MemoryManager,
-        pose: AgentPose,
-    ) -> List[GoalProposal]:
-        proposals: List[GoalProposal] = []
-        for node in memory.topo_map.get_nodes_by_type(NodeType.WAYPOINT_FRONTIER):
-            if node.attributes.get("consumed", False):
-                continue
-            if node.attributes.get("blocked", False):
-                continue
-            dist = _distance(pose.position, node.position)
-            frontier_value = float(node.confidence)
-            semantic_value, semantic_reason = self._frontier_task_value(goal, memory, node)
-            blocked_penalty = 0.30 if node.attributes.get("blocked", False) else 0.0
-            failed_count = float(node.attributes.get("failed_count", 0) or 0)
-            unreachable_count = float(node.attributes.get("unreachable_count", 0) or 0)
-            failed_penalty = 0.20 * failed_count
-            risk_penalty = min(1.0, blocked_penalty + failed_penalty + 0.35 * unreachable_count)
-            score = (
-                0.35 * frontier_value
-                + 0.30 * semantic_value
-                - 0.03 * dist
-                - risk_penalty
-            )
-            reason = (
-                f"frontier; value={frontier_value:.2f}; "
-                f"semantic={semantic_value:.2f}; risk={risk_penalty:.2f}; "
-                f"{semantic_reason}"
-            )
-            proposals.append(
-                self._with_reason(GoalProposal(
-                    goal_id=goal_id,
-                    candidate_node_id=node.node_id,
-                    candidate_type="frontier",
-                    target_position=node.position.copy(),
-                    score=score,
-                    frontier_value=frontier_value,
-                    distance_cost=dist,
-                    reachability_score=max(0.0, 1.0 - risk_penalty),
-                    risk_penalty=risk_penalty,
-                    negative_evidence=failed_count + unreachable_count,
-                    source="navigation_layer",
-                    can_stop=False,
-                    requires_verification=False,
-                    evidence_refs=[node.node_id],
-                ), reason)
-            )
-        return proposals
-
-    def _deduplicate(self, proposals: List[GoalProposal]) -> List[GoalProposal]:
-        best: Dict[tuple, GoalProposal] = {}
-        for proposal in proposals:
-            key = (
-                proposal.goal_id,
-                proposal.candidate_type,
-                proposal.candidate_node_id,
-            )
-            if key not in best or proposal.score > best[key].score:
-                best[key] = proposal
-        return list(best.values())
-
-    def _task_score_object(
-        self,
-        goal: GoalNode,
-        entry: ObjectMemoryEntry,
-    ) -> float:
-        score = 0.0
-        if entry.label.lower().strip() == str(goal.target_object).lower().strip():
-            score += 0.8
-
-        attrs = entry.attributes or {}
-        attr_text = str(attrs).lower()
-        for attr in [str(a).lower() for a in goal.attributes or []]:
-            if attr in attr_text:
-                score += 0.1
-
-        return min(1.0, score)
-
-    def _frontier_task_value(
-        self,
-        goal: GoalNode,
-        memory: MemoryManager,
-        node: SemanticNode,
-    ) -> tuple:
-        value = float(node.attributes.get("semantic_value", 0.0) or 0.0)
-        reasons: List[str] = []
-
-        room_priors = {str(room).lower().strip() for room in goal.room_prior or []}
-        landmark_priors = {str(label).lower().strip() for label in goal.landmarks or []}
-
-        room_label = str(node.attributes.get("room_label", "")).lower().strip()
-        created_from = node.attributes.get("created_from")
-        if not room_label and created_from:
-            parent = memory.topo_map.get_node(str(created_from))
-            if parent is not None:
-                room_label = str(parent.attributes.get("room_label", "")).lower().strip()
-
-        if room_label and room_label in room_priors:
-            value += 0.45
-            reasons.append(f"room_prior={room_label}")
-
-        if landmark_priors:
-            nearby_landmarks = memory.topo_map.find_nodes_within_radius(
-                node.position,
-                radius=5.0,
-                node_type=NodeType.LANDMARK,
-            )
-            matched = [
-                landmark.label
-                for landmark in nearby_landmarks
-                if str(landmark.label).lower().strip() in landmark_priors
-            ]
-            if matched:
-                value += 0.30
-                reasons.append(f"near_landmark={matched[0]}")
-
-        if not node.attributes.get("visited", False):
-            value += 0.10
-            reasons.append("unexplored")
-
-        if node.attributes.get("blocked", False):
-            reasons.append("blocked")
-        failed_count = int(node.attributes.get("failed_count", 0) or 0)
-        if failed_count:
-            reasons.append(f"failed={failed_count}")
-
-        return min(1.0, value), ",".join(reasons) or "generic"
-
-    def _task_score_hypothesis(self, goal: GoalNode, hyp: Hypothesis) -> float:
-        label = hyp.label.lower().strip()
-        target = str(goal.target_object).lower().strip()
-
-        if hyp.kind == "object" and label == target:
-            return 0.8
-
-        if hyp.kind == "room":
-            room_priors = {str(room).lower().strip() for room in goal.room_prior or []}
-            return 0.7 if label in room_priors else 0.2
-
-        if hyp.kind == "landmark":
-            landmarks = {str(landmark).lower().strip() for landmark in goal.landmarks or []}
-            return 0.6 if label in landmarks else 0.2
-
-        return 0.1
-
-    @staticmethod
-    def _with_reason(proposal: GoalProposal, reason: str) -> GoalProposal:
-        setattr(proposal, "reason", reason)
-        return proposal
-
-    @staticmethod
-    def _proposal_debug(proposal: GoalProposal) -> Dict[str, Any]:
-        return {
-            "node_id": proposal.candidate_node_id,
-            "type": proposal.candidate_type,
-            "score": round(float(proposal.score), 4),
-            "source": proposal.source,
-            "can_stop": proposal.can_stop,
-            "requires_verification": proposal.requires_verification,
-            "distance_cost": round(float(proposal.distance_cost), 4),
-            "reachability_score": round(float(proposal.reachability_score), 4),
-            "risk_penalty": round(float(proposal.risk_penalty), 4),
-            "negative_evidence": round(float(proposal.negative_evidence), 4),
-            "evidence_refs": list(proposal.evidence_refs),
-            "reason": str(getattr(proposal, "reason", "")),
-        }
-
-
-class Planner:
-    """Select the next navigation target from proposals."""
-
-    def select_target(
-        self,
-        *,
-        proposals: List[GoalProposal],
-        memory: MemoryManager,
-        pose: AgentPose,
-        state: AgentState,
-    ) -> NavigationTarget:
-        if not proposals:
-            return NavigationTarget(node_id=None, position=None, target_type="idle")
-
-        def total_score(proposal: GoalProposal) -> float:
-            type_bonus = {
-                "object": 0.30,
-                "room": 0.15,
-                "hypothesis": 0.20,
-                "frontier": 0.00,
-            }.get(proposal.candidate_type, 0.0)
-            return (
-                proposal.score
-                + type_bonus
-                - 0.05 * proposal.risk_penalty
-                - 0.10 * proposal.negative_evidence
-            )
-
-        object_proposals = [p for p in proposals if p.candidate_type == "object"]
-        if object_proposals:
-            best_object = max(object_proposals, key=total_score)
-            fallback_proposals = [
-                p for p in proposals if p.candidate_type != "object"
-            ]
-            if not fallback_proposals:
-                best = best_object
-            else:
-                best_fallback = max(fallback_proposals, key=total_score)
-                object_score = total_score(best_object)
-                fallback_score = total_score(best_fallback)
-                object_is_usable = (
-                    best_object.reachability_score >= 0.35
-                    and best_object.risk_penalty < 0.50
-                    and object_score >= fallback_score - 0.10
-                )
-                best = best_object if object_is_usable else best_fallback
-        else:
-            hypothesis_proposals = [
-                p for p in proposals if p.candidate_type == "hypothesis"
-            ]
-            best = (
-                max(hypothesis_proposals, key=total_score)
-                if hypothesis_proposals
-                else max(proposals, key=total_score)
-            )
-        return NavigationTarget(
-            node_id=best.candidate_node_id,
-            position=best.target_position,
-            target_type=best.candidate_type,
-            proposal=best,
-        )
-
-
-class Controller:
-    """Converts selected targets and state decisions to environment actions."""
-
-    def search_action(self, nav_target: NavigationTarget) -> Dict[str, Any]:
-        if nav_target.position is None:
-            return {"action": "turn_left", "reason": "search_no_target"}
-        return {
-            "action": "navigate",
-            "target_position": nav_target.position,
-            "target_node_id": nav_target.node_id,
-            "target_type": nav_target.target_type,
-        }
-
-    def approach_action(
-        self,
-        vlm_report: Optional[Dict[str, Any]],
-        nav_target: NavigationTarget,
-        goal: Optional[GoalNode] = None,
-    ) -> Dict[str, Any]:
-        bbox = _target_bbox(vlm_report, goal)
-        if bbox is not None:
-            center = 0.5 * (float(bbox[0]) + float(bbox[2]))
-            if center < 0.35:
-                return {"action": "turn_left", "reason": "approach_center_target"}
-            if center > 0.65:
-                return {"action": "turn_right", "reason": "approach_center_target"}
-            return {"action": "move_forward", "reason": "approach_visible_target"}
-        return self.search_action(nav_target)
-
-    def verify_action(
-        self,
-        vlm_report: Optional[Dict[str, Any]] = None,
-        goal: Optional[GoalNode] = None,
-    ) -> Dict[str, Any]:
-        fresh = bool(vlm_report and vlm_report.get("fresh", False))
-        bbox = _target_bbox(vlm_report, goal)
-        if bbox is None:
-            return {"action": "turn_left", "reason": "verify_scan_no_target"}
-        if not fresh:
-            return {"action": "move_forward", "reason": "verify_wait_for_fresh"}
-        center = _bbox_center_x(bbox)
-        if center is None:
-            return {"action": "turn_left", "reason": "verify_scan_no_bbox"}
-        if center < 0.35:
-            return {"action": "turn_left", "reason": "verify_center_target"}
-        if center > 0.65:
-            return {"action": "turn_right", "reason": "verify_center_target"}
-        return {"action": "move_forward", "reason": "verify_hold_centered"}
-
-    def stop_action(self) -> Dict[str, Any]:
-        return {"action": "stop", "reason": "verified_goal"}
-
-
-class StopVerifier:
-    """Multi-frame stop gate.  SEARCH/TRACK cannot stop directly."""
-
-    def observe(
-        self,
-        state: AgentState,
-        vlm_report: Optional[Dict[str, Any]],
-        goal: Optional[GoalNode],
-    ) -> bool:
-        if not vlm_report or not bool(vlm_report.get("fresh", False)):
-            return False
-        state.verify_attempts += 1
-        best = _target_object(vlm_report, goal)
-        if best is not None:
-            state.verify_area_window.append(_bbox_area(best.get("bbox")))
-            state.verify_area_window = state.verify_area_window[-4:]
-        hit = self._single_frame_stop_hit(vlm_report, goal, state)
-        state.verify_window.append(hit)
-        state.verify_window = state.verify_window[-4:]
-        state.verify_hits = sum(1 for item in state.verify_window if item)
-        return state.verify_hits >= 2
-
-    def should_enter_verify(
-        self,
-        vlm_report: Optional[Dict[str, Any]],
-        goal: Optional[GoalNode],
-    ) -> bool:
-        best = _target_object(vlm_report, goal)
-        if best is None:
-            return False
-        bbox_area = _bbox_area(best.get("bbox"))
-        range_bin = str(best.get("range_bin", "")).lower()
-        return _range_area_close_enough_for_verify(range_bin, bbox_area)
-
-    def _single_frame_stop_hit(
-        self,
-        vlm_report: Optional[Dict[str, Any]],
-        goal: Optional[GoalNode],
-        state: AgentState,
-    ) -> bool:
-        if not vlm_report or not bool(vlm_report.get("goal_visible", False)):
-            return False
-        best = _target_object(vlm_report, goal)
-        if best is None:
-            return False
-        bbox = best.get("bbox")
-        bbox_area = _bbox_area(bbox)
-        range_bin = str(best.get("range_bin", "")).lower()
-        bbox_confidence = str(best.get("bbox_confidence", "")).lower()
-        visibility = str(best.get("visibility", "")).lower()
-        center = _bbox_center_x(bbox)
-        centered = center is None or 0.15 <= center <= 0.90
-        area_growing = _area_trend(state.verify_area_window) >= 0.015
-        area_holding_close = (
-            len(state.verify_area_window) >= 2
-            and min(state.verify_area_window[-2:]) >= 0.08
-            and state.verify_area_window[-1] >= 0.9 * state.verify_area_window[-2]
-        )
-        close_enough = _range_area_close_enough_for_stop(range_bin, bbox_area)
-        strong_visual_stop = (
-            close_enough
-            and bbox_confidence != "low"
-            and visibility not in {"occluded", "not_visible"}
-            and centered
-            and (area_growing or area_holding_close)
-        )
-        vlm_stop_candidate = (
-            bool(vlm_report.get("stop_candidate", False))
-            and close_enough
-            and (area_growing or area_holding_close)
-        )
-        return (
-            vlm_stop_candidate
-            or strong_visual_stop
-        )
+        return report
 
 
 class GOATAgent(ConfTopoBaseAgent):
-    """Monolithic GOAT agent with modular internals."""
+    """Agent1 clean orchestration agent."""
 
     def __init__(self, config: Optional[ConfTopoConfig] = None):
         super().__init__(config)
         self.goal_manager = GoalManager(self)
-        self.perception = PerceptionModule(self.config)
-        self.memory = MemoryManager(self.topo_map, self.config)
-        self.proposal_builder = ProposalBuilder()
-        self.planner = Planner()
-        self.controller = Controller()
-        self.stop_verifier = StopVerifier()
-        self.state = AgentState()
-
-        self.step_id: int = 0
-        self._origin_position: Optional[np.ndarray] = None
+        self.perception = Agent1Perception(self.config)
+        self.memory = Agent1MemoryWriter(self.topo_map)
+        self.structure_planner = StructurePlanner()
+        self.navigation_planner = NavigationPlanner()
+        self.active_projector = ActiveTopoProjector(
+            ProjectionConfig(suppress_enabled=True, verify_enabled=True, fold_enabled=True)
+        )
+        self._active_view = ActiveTopoView()
+        self._recovery = RecoveryState()
+        self._active_view_signature: Optional[tuple] = None
+        self._recovery_ref_pose: Optional[np.ndarray] = None
+        self._recovery_ref_step: int = 0
+        self._verify_success_count = 0
+        self._verify_fail_count = 0
+        self._last_needs_verify = False
+        self.state_machine = StateMachine()
+        self.step_id = 0
         self._pose: Optional[AgentPose] = None
         self._rgb: Optional[np.ndarray] = None
         self._rgb_embed: Optional[np.ndarray] = None
-        self._last_clip_hint: ClipHint = ClipHint()
-        self._fresh_vlm_report: Optional[Dict[str, Any]] = None
-        self._cached_vlm_report: Optional[Dict[str, Any]] = None
-        self._cached_vlm_step: int = -1
-        self._vlm_for_control: Optional[Dict[str, Any]] = None
-        self._last_proposals: List[GoalProposal] = []
-        self._last_nav_target: NavigationTarget = NavigationTarget(None, None)
-        self._last_pose_for_stuck: Optional[np.ndarray] = None
-        self._stuck_monitor_target_id: Optional[str] = None
-        self._stuck_marked_target_id: Optional[str] = None
+        self._clip_report = PerceptionReport()
+        self._vlm_report: Optional[PerceptionReport] = None
+        self._last_intent = None
+        self._last_nav_target = NavigationTarget(None, None)
+        self._sticky_nav_target = NavigationTarget(None, None)
+        self._sticky_nav_steps = 0
+        self._pathfinder = None
+        self._nav_sim = None
+        self._nav_origin_world: Optional[np.ndarray] = None
+        self._pathfinder_executor = PathfinderExecutor(
+            reach_radius=NAV_REACH_RADIUS,
+            waypoint_radius=NAV_REACH_RADIUS,
+            turn_threshold=0.35,
+        )
+        self._cur_perception: Dict[str, Any] = {}
+        self._last_debug: Dict[str, Any] = {}
+        self._nav_history: List[NavigationHistoryEntry] = []
+        self._target_progress: Dict[str, Dict[str, Any]] = {}
+        self._stale_target_until_step: Dict[str, int] = {}
+        self._last_planning_context = PlanningContext()
+        self._force_vlm_scan_steps = 0
+        self._goal_visible_vlm_steps = 0
+        self._visual_scan_steps = 0
+        self._scan_context = ScanContext()
+        self._last_valid_vlm_report: Optional[PerceptionReport] = None
+        self._last_valid_vlm_step = -1
+        self._last_valid_vlm_pose: Optional[np.ndarray] = None
+        self._last_reachability_probe: Dict[str, Any] = {}
+        self.memory.set_frontier_probe(self._probe_reachable)
 
-    def reset(self) -> None:
+    def set_clip_encoder(self, encoder: Any) -> None:
+        self.perception.set_clip_encoder(encoder)
+        goal = self.goal_manager.current_goal()
+        if goal is not None:
+            self.perception.configure_goal(goal)
+
+    def reset(self):
         super().reset()
-        self.memory = MemoryManager(self.topo_map, self.config)
-        self.state = AgentState(transition_reason="reset")
+        self.memory = Agent1MemoryWriter(self.topo_map)
+        self.structure_planner = StructurePlanner()
+        self.navigation_planner = NavigationPlanner()
+        self.active_projector = ActiveTopoProjector(
+            ProjectionConfig(suppress_enabled=True, verify_enabled=True, fold_enabled=True)
+        )
+        self._active_view = ActiveTopoView()
+        self._recovery = RecoveryState()
+        self._active_view_signature = None
+        self._recovery_ref_pose = None
+        self._recovery_ref_step = 0
+        self._verify_success_count = 0
+        self._verify_fail_count = 0
+        self._last_needs_verify = False
+        self.state_machine = StateMachine()
         self.step_id = 0
-        self._origin_position = None
-        self._pose = None
-        self._rgb = None
-        self._rgb_embed = None
-        self._last_clip_hint = ClipHint()
-        self._fresh_vlm_report = None
-        self._cached_vlm_report = None
-        self._cached_vlm_step = -1
-        self._vlm_for_control = None
-        self._last_proposals = []
         self._last_nav_target = NavigationTarget(None, None)
-        self._last_pose_for_stuck = None
-        self._stuck_monitor_target_id = None
-        self._stuck_marked_target_id = None
+        self._sticky_nav_target = NavigationTarget(None, None)
+        self._sticky_nav_steps = 0
+        self._nav_history = []
+        self._target_progress = {}
+        self._stale_target_until_step = {}
+        self._last_planning_context = PlanningContext()
+        self._force_vlm_scan_steps = 0
+        self._goal_visible_vlm_steps = 0
+        self._visual_scan_steps = 0
+        self._scan_context = ScanContext()
+        self._last_valid_vlm_report = None
+        self._last_valid_vlm_step = -1
+        self._last_valid_vlm_pose = None
+        self._last_reachability_probe = {}
+        self.perception.last_vlm_step = -1
+        self.perception.last_vlm_reason = "reset"
+        self.memory.set_frontier_probe(self._probe_reachable)
 
-    def reset_keep_memory(self) -> None:
+    def reset_keep_memory(self):
         super().reset_keep_memory()
-        self.state = AgentState(transition_reason="new_goal")
         self.memory.reset_runtime()
-        self._fresh_vlm_report = None
-        self._cached_vlm_report = None
-        self._cached_vlm_step = -1
-        self._vlm_for_control = None
-        self._last_proposals = []
-        self._last_nav_target = NavigationTarget(None, None)
-        self._last_pose_for_stuck = None
-        self._stuck_monitor_target_id = None
-        self._stuck_marked_target_id = None
+        self.state_machine.reset_for_goal()
+        self._sticky_nav_target = NavigationTarget(None, None)
+        self._sticky_nav_steps = 0
+        self._target_progress = {}
+        self._stale_target_until_step = {}
+        self._nav_history = []
+        self._force_vlm_scan_steps = 0
+        self._goal_visible_vlm_steps = 0
+        self._visual_scan_steps = 0
+        self._scan_context = ScanContext()
+        self._last_valid_vlm_report = None
+        self._last_valid_vlm_step = -1
+        self._last_valid_vlm_pose = None
+        self.perception.last_vlm_step = -1
+        self.perception.last_vlm_reason = "reset_keep_memory"
+
+    def set_pathfinder(self, pathfinder: Any) -> None:
+        self._pathfinder = pathfinder
+        self._nav_sim = pathfinder
+
+    def set_navigation_context(self, sim: Any, origin_world: Any) -> None:
+        self._pathfinder = sim
+        self._nav_sim = sim
+        self._nav_origin_world = np.asarray(origin_world, dtype=np.float32).copy()
+        self.memory.set_frontier_probe(self._probe_reachable)
+
+    def _probe_reachable(
+        self,
+        position_relative: np.ndarray,
+        node_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if self._nav_sim is None or self._nav_origin_world is None:
+            return {
+                "reachable": False,
+                "reason": "reachability_unavailable",
+                "target_position": np.asarray(position_relative, dtype=np.float32).round(4).tolist(),
+                "target_node_id": node_id,
+            }
+        raw_position = np.asarray(position_relative, dtype=np.float32)
+        try:
+            probe = self._pathfinder_executor.probe(
+                self._nav_sim,
+                raw_position,
+                self._nav_origin_world,
+                target_node_id=node_id,
+            )
+            data = probe.to_dict()
+        except Exception as exc:
+            data = {
+                "reachable": False,
+                "reason": f"probe_error:{type(exc).__name__}",
+                "target_position": raw_position.round(4).tolist(),
+                "target_node_id": node_id,
+            }
+        target_position = data.get("target_position") or data.get("target_position_relative")
+        data["candidate_position"] = raw_position.round(4).tolist()
+        if target_position is not None:
+            data["target_position"] = target_position
+            if not np.allclose(raw_position, np.asarray(target_position, dtype=np.float32), atol=1e-3):
+                data["snapped_from"] = raw_position.round(4).tolist()
+        self._last_reachability_probe = dict(data)
+        return data
 
     def set_new_goal(self, goal: GoalNode) -> None:
-        self.reset_keep_memory()
         self.goal_manager.set_goal(goal)
         self.perception.configure_goal(goal)
+        self.state_machine.reset_for_goal()
+        self._active_view = ActiveTopoView()
+        self._recovery.reset()
+        self._active_view_signature = None
+        self._recovery_ref_pose = None
+        self._recovery_ref_step = 0
+        self._verify_success_count = 0
+        self._verify_fail_count = 0
+        self._last_needs_verify = False
+        self._sticky_nav_target = NavigationTarget(None, None)
+        self._sticky_nav_steps = 0
+        self._target_progress = {}
+        self._stale_target_until_step = {}
+        self._nav_history = []
+        self._force_vlm_scan_steps = 0
+        self._goal_visible_vlm_steps = 0
+        self._visual_scan_steps = 0
+        self._scan_context = ScanContext()
+        self._last_valid_vlm_report = None
+        self._last_valid_vlm_step = -1
+        self._last_valid_vlm_pose = None
+        self.perception.last_vlm_step = -1
+        self.perception.last_vlm_reason = "new_goal"
 
     def observe(self, obs: Dict[str, Any]) -> None:
-        raw_position = np.asarray(obs["position"], dtype=np.float32)
-        if self._origin_position is None:
-            self._origin_position = raw_position.copy()
-        position = raw_position - self._origin_position
-        position[1] = 0.0
-        self._pose = AgentPose(
-            position=position,
-            heading=float(obs.get("heading", 0.0)),
-        )
+        pos = np.asarray(obs.get("position", np.zeros(3, dtype=np.float32)), dtype=np.float32)
+        pos = pos.copy()
+        pos[1] = 0.0
+        self._pose = AgentPose(position=pos, heading=float(obs.get("heading", 0.0)))
         self._rgb = obs.get("rgb")
-        if "rgb_embed" in obs:
-            self._rgb_embed = np.asarray(obs["rgb_embed"], dtype=np.float32)
-        elif "pano_rgb_embed" in obs:
-            self._rgb_embed = np.asarray(obs["pano_rgb_embed"], dtype=np.float32)
-        else:
-            self._rgb_embed = None
+        self._rgb_embed = obs.get("rgb_embed")
+
+        goal = self.goal_manager.current_goal()
+        state_name = self.state_machine.state.mode.value
+        self._clip_report = self.perception.run_clip(self._rgb_embed, step_id=self.step_id)
+        need_vlm = self.perception.should_run_vlm(
+            clip_report=self._clip_report,
+            goal=goal,
+            state=state_name,
+            step_id=self.step_id,
+        )
+        vlm_scan_type = ""
+        if (
+            (self._scan_context.active() or self._force_vlm_scan_steps > 0 or self._goal_visible_vlm_steps > 0)
+            and self.perception.vlm is not None
+            and goal is not None
+        ):
+            need_vlm = True
+            vlm_scan_type = (
+                self._scan_context.scan_type
+                if self._scan_context.active()
+                else "frontier"
+                if self._force_vlm_scan_steps > 0
+                else "goal_visible_followup"
+            )
+            self.perception.last_vlm_reason = (
+                f"{self._scan_context.scan_type}_scan"
+                if self._scan_context.active()
+                else "frontier_reached_scan"
+                if self._force_vlm_scan_steps > 0
+                else "goal_visible_followup"
+            )
+            if self._force_vlm_scan_steps > 0:
+                self._force_vlm_scan_steps -= 1
+            if self._goal_visible_vlm_steps > 0:
+                self._goal_visible_vlm_steps -= 1
+        self._vlm_report = (
+            self.perception.run_vlm(
+                self._rgb,
+                goal=goal,
+                clip_report=self._clip_report,
+                state=state_name,
+                step_id=self.step_id,
+                scan_type=vlm_scan_type,
+            )
+            if need_vlm
+            else None
+        )
+        if self._vlm_report is not None and bool(self._vlm_report.goal_visible):
+            # Keep a short follow-up window after any positive sighting so
+            # CONFIRM gets denser evidence instead of one-frame spikes.
+            self._goal_visible_vlm_steps = max(self._goal_visible_vlm_steps, 5)
+        if self._vlm_report is not None and self._vlm_report.is_full:
+            self._last_valid_vlm_report = self._vlm_report
+            self._last_valid_vlm_step = int(self.step_id)
+            self._last_valid_vlm_pose = None if self._pose is None else self._pose.position.copy()
+        self._cur_perception = self._perception_debug(need_vlm)
 
     def update_memory(self) -> None:
         if self._pose is None:
             return
-        self.memory.update_step_memory(
-            clip_hint=self._last_clip_hint,
-            vlm_report=self._fresh_vlm_report,
+        self.memory.update(
             pose=self._pose,
+            rgb=self._rgb,
             rgb_embed=self._rgb_embed,
+            clip_report=self._clip_report,
+            vlm_report=self._vlm_report,
             goal=self.goal_manager.current_goal(),
+            object_crop_encoder=self.perception.encode_object_crop,
+            object_text_encoder=self.perception.encode_object_text,
+            allow_frontier_generation=not self._scan_context.active(),
         )
+
+    def _active_goal_id(self, goal: Optional[GoalNode]) -> Optional[str]:
+        if goal is None:
+            return None
+        return str(goal.image_cache_key or goal.goal_image_id or goal.target_object)
+
+    RECOVERY_BUDGET = 20
+    RECOVERY_PROGRESS_RADIUS = 1.5
+
+    def _update_recovery(self) -> None:
+        """Escalate recovery when the active region is exhausted (no spatial
+        search progress for a budget of steps). Escalation relaxes folding in
+        the projector so the agent can reach next-relevant / previously folded
+        regions instead of oscillating in a wrong room."""
+        if self._pose is None:
+            return
+        pos = np.asarray(self._pose.position, dtype=np.float32)
+        if self._recovery_ref_pose is None:
+            self._recovery_ref_pose = pos.copy()
+            self._recovery_ref_step = self.step_id
+            return
+        moved = float(np.linalg.norm(pos - self._recovery_ref_pose))
+        if moved >= self.RECOVERY_PROGRESS_RADIUS:
+            self._recovery_ref_pose = pos.copy()
+            self._recovery_ref_step = self.step_id
+            return
+        no_progress = int(self.step_id - self._recovery_ref_step)
+        current_region = ActiveTopoProjector._room_of_waypoint(
+            self.topo_map, self._active_view.entry_waypoint
+        )
+        if self._recovery.maybe_escalate(
+            no_progress_steps=no_progress,
+            budget=self.RECOVERY_BUDGET,
+            current_region=current_region,
+        ):
+            self._recovery_ref_step = self.step_id
+            self._active_view_signature = None
+
+    def _maybe_rebuild_active_view(self) -> None:
+        """Event-driven ActiveTopoView refresh.
+
+        Phase B: the view is observability-only (all nodes ACTIVE), so it never
+        changes planner behavior. We still rebuild on meaningful events -- goal
+        switch, node-count change, recovery-level change -- so the trace's
+        rebuild_count and activity distribution are informative rather than
+        rebuilding blindly every step.
+        """
+        goal = self.goal_manager.current_goal()
+        signature = (
+            self._active_goal_id(goal),
+            len(self.topo_map.structure_layer.nodes()),
+            len(self.topo_map.navigation_layer.nodes()),
+            self._recovery.level,
+        )
+        if signature == self._active_view_signature and self._active_view.node_infos:
+            return
+        self._active_view = self.active_projector.build(
+            topo_map=self.topo_map,
+            goal=goal,
+            pose=self._pose,
+            recovery_level=self._recovery.level,
+            prev_view=self._active_view,
+            goal_id=self._active_goal_id(goal),
+            step_id=self.step_id,
+        )
+        self._active_view_signature = signature
 
     def plan(self) -> NavigationTarget:
         if self._pose is None:
-            return NavigationTarget(None, None, "idle")
-        self._last_proposals = self.proposal_builder.build(
-            goal=self.goal_manager.current_goal(),
-            memory=self.memory,
+            self._last_nav_target = NavigationTarget(None, None, "idle")
+            return self._last_nav_target
+        self._update_recovery()
+        self._maybe_rebuild_active_view()
+        if (
+            self.state_machine.state.mode.value == "CONFIRM"
+            and self._last_nav_target.node_id is not None
+            and self._last_nav_target.position is not None
+        ):
+            self._last_planning_context = self._build_planning_context()
+            return self._last_nav_target
+        if self._scan_context.active():
+            planning_context = self._build_planning_context()
+            anchor = (
+                self.topo_map.get_node(str(self._scan_context.anchor_node_id))
+                if self._scan_context.anchor_node_id
+                else None
+            )
+            target = NavigationTarget(
+                node_id=self._scan_context.anchor_node_id,
+                position=None if anchor is None else anchor.position.copy(),
+                target_type=self._scan_context.scan_type,
+                reason=f"scan_active:{self._scan_context.scan_type}",
+                structure_node_id=self._scan_context.structure_node_id,
+            )
+            self._last_nav_target = target
+            self._last_planning_context = planning_context
+            return target
+        self._update_navigation_progress()
+        planning_context = self._build_planning_context()
+        goal = self.goal_manager.current_goal()
+        intents = self.structure_planner.build_intents(
+            topo_map=self.topo_map,
+            hypotheses=self.memory.hypothesis_pool,
+            goal=goal,
             pose=self._pose,
+            planning_context=planning_context,
+            active_view=self._active_view,
         )
-        self._last_nav_target = self.planner.select_target(
-            proposals=self._last_proposals,
-            memory=self.memory,
+        top_intents = intents[:3] if intents else []
+        target = self.navigation_planner.select_from_intents(
+            topo_map=self.topo_map,
+            intents=top_intents,
             pose=self._pose,
-            state=self.state,
+            planning_context=planning_context,
+            active_view=self._active_view,
         )
-        return self._last_nav_target
+        target = self._stabilize_navigation_target(target, planning_context)
+        self._last_intent = target.source_intent or (top_intents[0] if top_intents else None)
+        self._last_nav_target = target
+        self._last_planning_context = planning_context
+        self._record_navigation_selection(target)
+        return target
+
+    def _stabilize_navigation_target(
+        self,
+        target: NavigationTarget,
+        planning_context: Optional[PlanningContext] = None,
+    ) -> NavigationTarget:
+        """Keep a still-valid navigation target briefly to avoid frontier oscillation."""
+        if self._pose is None:
+            return target
+        sticky = self._sticky_nav_target
+        keep = False
+        if sticky.node_id and sticky.position is not None and self._sticky_nav_steps < 18:
+            node = self.topo_map.get_node(str(sticky.node_id))
+            dist = float(np.linalg.norm(sticky.position - self._pose.position))
+            sticky_intent = sticky.source_intent.intent_type if sticky.source_intent else None
+            new_intent = target.source_intent.intent_type if target.source_intent else None
+            stale = bool(planning_context and sticky.node_id in planning_context.stale_target_ids)
+            same_task = (
+                sticky_intent == new_intent
+                or sticky_intent == "explore" and new_intent in {"explore", "hypothesis"}
+                or sticky_intent == "hypothesis" and new_intent == "explore"
+            )
+            keep = (
+                node is not None
+                and node.node_type in self.topo_map._NAV_NODE_TYPES
+                and not node.attributes.get("blocked", False)
+                and not node.attributes.get("consumed", False)
+                and dist > NAV_REACH_RADIUS
+                and same_task
+                and not stale
+            )
+        if keep:
+            self._sticky_nav_steps += 1
+            sticky.reason = f"{sticky.reason}; sticky={self._sticky_nav_steps}"
+            return sticky
+        self._sticky_nav_target = target
+        self._sticky_nav_steps = 0
+        return target
+
+    def _record_history_entry(
+        self,
+        *,
+        target: Optional[NavigationTarget] = None,
+        node_id: Optional[str] = None,
+        target_type: str = "",
+        structure_node_id: Optional[str] = None,
+        distance: Optional[float] = None,
+        progress_delta: float = 0.0,
+        event: str,
+    ) -> None:
+        if target is not None:
+            node_id = target.node_id
+            target_type = target.target_type
+            structure_node_id = target.structure_node_id
+            if distance is None:
+                distance = self._target_distance(target)
+        self._nav_history.append(NavigationHistoryEntry(
+            step_id=int(self.step_id),
+            node_id=node_id,
+            target_type=str(target_type or ""),
+            structure_node_id=structure_node_id,
+            distance=None if distance is None else float(distance),
+            progress_delta=float(progress_delta),
+            event=event,
+        ))
+        self._nav_history = self._nav_history[-160:]
+
+    def _target_distance(self, target: NavigationTarget) -> Optional[float]:
+        if self._pose is None or target.position is None:
+            return None
+        delta = np.asarray(target.position, dtype=np.float32) - self._pose.position
+        return float(np.linalg.norm(delta))
+
+    def _record_navigation_selection(self, target: NavigationTarget) -> None:
+        if not target.node_id:
+            return
+        self._record_history_entry(target=target, event="selected")
+
+    def _update_navigation_progress(self) -> None:
+        target = self._last_nav_target
+        if self._pose is None or not target.node_id or target.position is None:
+            return
+        target_id = str(target.node_id)
+        dist = self._target_distance(target)
+        if dist is None:
+            return
+        state = self._target_progress.get(target_id)
+        if state is None:
+            self._target_progress[target_id] = {
+                "best_distance": dist,
+                "last_distance": dist,
+                "stale_steps": 0,
+            }
+            return
+        best = float(state.get("best_distance", dist))
+        progress_delta = best - dist
+        if progress_delta > 0.05:
+            state["best_distance"] = dist
+            state["stale_steps"] = 0
+        else:
+            state["stale_steps"] = int(state.get("stale_steps", 0) or 0) + 1
+        state["last_distance"] = dist
+        state["last_progress_delta"] = progress_delta
+        stale_steps = int(state.get("stale_steps", 0) or 0)
+        if stale_steps >= 12:
+            until = int(self.step_id + 20)
+            if int(self._stale_target_until_step.get(target_id, 0) or 0) < self.step_id:
+                self._record_history_entry(
+                    target=target,
+                    distance=dist,
+                    progress_delta=progress_delta,
+                    event="stale_no_progress",
+                )
+            self._stale_target_until_step[target_id] = until
+            state["stale_steps"] = 0
+
+    def _build_planning_context(self) -> PlanningContext:
+        current_step = int(self.step_id)
+        self._stale_target_until_step = {
+            str(node_id): int(until)
+            for node_id, until in self._stale_target_until_step.items()
+            if int(until) > current_step
+        }
+        recent_target_counts: Dict[str, int] = {}
+        for entry in self._nav_history[-32:]:
+            if entry.event != "selected" or not entry.node_id:
+                continue
+            node_id = str(entry.node_id)
+            recent_target_counts[node_id] = recent_target_counts.get(node_id, 0) + 1
+        current_waypoint = self._current_waypoint_id()
+        return PlanningContext(
+            recent_target_counts=recent_target_counts,
+            stale_target_ids=dict(self._stale_target_until_step),
+            current_waypoint_id=current_waypoint,
+            trajectory=self._trajectory_ids(),
+            recent_failures=list(self.topo_map.failed_target_history[-8:]),
+        )
+
+    def _current_waypoint_id(self) -> Optional[str]:
+        if self._pose is None:
+            return None
+        best = None
+        best_dist = float("inf")
+        for node in self.topo_map.navigation_layer.nodes():
+            if node.node_type != NodeType.WAYPOINT_VISITED:
+                continue
+            dist = float(np.linalg.norm(node.position - self._pose.position))
+            if dist < best_dist:
+                best = node
+                best_dist = dist
+        return best.node_id if best is not None else None
+
+    def _trajectory_ids(self) -> List[str]:
+        visited = [
+            node for node in self.topo_map.navigation_layer.nodes()
+            if node.node_type == NodeType.WAYPOINT_VISITED
+        ]
+        visited.sort(
+            key=lambda node: (
+                int(node.attributes.get("last_reached_step", node.step_id) or node.step_id),
+                node.node_id,
+            )
+        )
+        return [node.node_id for node in visited[-32:]]
+
+    def _start_scan(
+        self,
+        scan_type: str,
+        *,
+        anchor_node_id: Optional[str],
+        structure_node_id: Optional[str],
+        steps: int = 8,
+    ) -> None:
+        self._scan_context = ScanContext(
+            scan_type=scan_type,
+            anchor_node_id=anchor_node_id,
+            structure_node_id=structure_node_id,
+            remaining_steps=int(steps),
+            fresh_vlm_required=True,
+            started_step=int(self.step_id),
+        )
+        self._force_vlm_scan_steps = max(self._force_vlm_scan_steps, int(steps))
+        self._visual_scan_steps = max(self._visual_scan_steps, int(steps))
+
+    def _scan_should_override(self) -> bool:
+        if not self._scan_context.active():
+            return False
+        if self._vlm_report is not None and bool(self._vlm_report.goal_visible):
+            self._scan_context = ScanContext()
+            self._visual_scan_steps = 0
+            return False
+        if self.state_machine.state.mode.value in {"CONFIRM", "STOP"}:
+            self._scan_context = ScanContext()
+            self._visual_scan_steps = 0
+            return False
+        return True
+
+    def _scan_sweep_action(self, target: NavigationTarget) -> Dict[str, Any]:
+        total = 8
+        elapsed = max(0, total - int(self._scan_context.remaining_steps))
+        scan_type = self._scan_context.scan_type
+        anchor_node_id = self._scan_context.anchor_node_id
+        # Observe current heading first, then sweep left and right over several
+        # simulator frames so side-facing objects can enter the camera.
+        pattern = [
+            "turn_left",
+            "turn_left",
+            "turn_left",
+            "turn_right",
+            "turn_right",
+            "turn_right",
+            "turn_right",
+            "turn_left",
+        ]
+        low_action = pattern[min(elapsed, len(pattern) - 1)]
+        self._scan_context.remaining_steps = max(0, int(self._scan_context.remaining_steps) - 1)
+        self._visual_scan_steps = max(0, int(self._scan_context.remaining_steps))
+        ctx_snapshot = self._scan_context.to_dict()
+        if self._scan_context.remaining_steps <= 0:
+            self._finish_scan_without_target()
+        return {
+            "action": low_action,
+            "reason": f"{scan_type or 'visual'}_sweep",
+            "target_node_id": anchor_node_id or target.node_id,
+            "target_type": target.target_type,
+            "scan_context": ctx_snapshot,
+        }
+
+    def _finish_scan_without_target(self) -> None:
+        ctx = self._scan_context
+        if not ctx.scan_type or ctx.failure_recorded:
+            self._scan_context = ScanContext()
+            return
+        if ctx.scan_type in {"object_anchor", "hypothesis_anchor", "portal_anchor"}:
+            structure_id = ctx.structure_node_id
+            anchor_id = ctx.anchor_node_id
+            if structure_id:
+                node = self.topo_map.get_node(str(structure_id))
+                if node is not None:
+                    bad = [str(x) for x in node.attributes.get("bad_anchor_waypoint_ids", []) or []]
+                    if anchor_id and str(anchor_id) not in bad:
+                        bad.append(str(anchor_id))
+                    node.attributes["bad_anchor_waypoint_ids"] = bad[-12:]
+                    node.attributes["failed_count"] = int(node.attributes.get("failed_count", 0) or 0) + 1
+                    node.attributes["last_failed_step"] = self.topo_map.current_step
+                    node.attributes["failure_reason"] = f"{ctx.scan_type}_no_visual_confirmation"
+            if anchor_id:
+                self._stale_target_until_step[str(anchor_id)] = int(self.step_id + 20)
+            self._record_history_entry(
+                node_id=anchor_id,
+                target_type=ctx.scan_type,
+                structure_node_id=structure_id,
+                event="scan_failed_no_target",
+            )
+        self._sticky_nav_target = NavigationTarget(None, None)
+        self._sticky_nav_steps = 0
+        ctx.failure_recorded = True
+        self._scan_context = ScanContext()
 
     def act(self, plan_output: NavigationTarget) -> Dict[str, Any]:
-        return self.act_with_state_machine(
-            nav_target=plan_output,
-            vlm_report=self._vlm_for_control,
+        control_report = self._vlm_report
+        fresh_report = self._vlm_report is not None and self._vlm_report.is_full
+        if control_report is None and self._last_valid_vlm_report is not None:
+            if int(self.step_id) - int(self._last_valid_vlm_step) <= 2:
+                control_report = self._last_valid_vlm_report
+        obj_node_id = (
+            plan_output.structure_node_id
+            if plan_output.source_intent and plan_output.source_intent.intent_type == "object"
+            else None
         )
+        needs_verify = bool(obj_node_id) and self._active_view.is_verify(obj_node_id)
+        self._last_needs_verify = needs_verify
+        detection_score = float(getattr(control_report, "goal_match_confidence", 0.0) or 0.0)
 
-    def report_navigation_failed(
-        self,
-        target_node_id: Optional[str] = None,
-        *,
-        unreachable: bool = False,
-    ) -> bool:
-        """Let the external executor report that the selected object target failed."""
-        nav_target = self._last_nav_target
-        proposal = nav_target.proposal
-        if proposal is None or proposal.candidate_type != "object":
-            return False
-        if target_node_id is not None and target_node_id != proposal.candidate_node_id:
-            return False
-
-        object_ids = [str(ref) for ref in proposal.evidence_refs if ref]
-        if not object_ids:
-            object_ids = [proposal.candidate_node_id]
-        for object_id in object_ids:
-            self.memory.mark_object_navigation_failed(
-                object_id,
-                unreachable=unreachable,
+        def _on_verify_success() -> None:
+            self.memory.record_object_verification(
+                obj_node_id, success=True, detection_score=detection_score,
             )
-        return True
+            self._verify_success_count += 1
+            self._active_view_signature = None  # force reprojection: C changed
+
+        def _on_verify_failure() -> None:
+            self.memory.record_object_verification(
+                obj_node_id, success=False, detection_score=detection_score,
+            )
+            self._verify_fail_count += 1
+            self._active_view_signature = None
+
+        action = self.state_machine.act(
+            step_id=self.step_id,
+            target=plan_output,
+            report=control_report,
+            goal=self.goal_manager.current_goal(),
+            fresh_report=fresh_report,
+            needs_verify=needs_verify,
+            on_verify_success=_on_verify_success,
+            on_verify_failure=_on_verify_failure,
+        )
+        if self._scan_should_override():
+            action = self._scan_sweep_action(plan_output)
+        action["debug"] = self._debug_snapshot()
+        if "target_node_id" not in action:
+            action["target_node_id"] = plan_output.node_id
+        if "target_type" not in action:
+            action["target_type"] = plan_output.target_type
+        return action
 
     def step(self, obs: Dict[str, Any]) -> Dict[str, Any]:
         self.step_id += 1
         self._step_count += 1
-
+        self.topo_map.step()
         self.observe(obs)
-        goal = self.goal_manager.current_goal()
-
-        self._last_clip_hint = self.perception.run_clip(self._rgb_embed, goal)
-        need_vlm = self.perception.should_trigger_vlm(
-            clip_hint=self._last_clip_hint,
-            goal=goal,
-            state=self.state,
-            step_id=self.step_id,
-        )
-        self._fresh_vlm_report = None
-        if need_vlm:
-            self._fresh_vlm_report = self.perception.run_vlm(
-                self._rgb,
-                goal,
-                step_id=self.step_id,
-                state=self.state,
-                clip_hint=self._last_clip_hint,
-            )
-            if self._fresh_vlm_report and self._fresh_vlm_report.get("fresh", False):
-                self._cached_vlm_report = self._fresh_vlm_report
-                self._cached_vlm_step = self.step_id
-
-        self._vlm_for_control = self._fresh_vlm_report
-        if (
-            self._vlm_for_control is None
-            and self._cached_vlm_report is not None
-            and self.step_id - self._cached_vlm_step <= 3
-        ):
-            self._vlm_for_control = dict(self._cached_vlm_report)
-            self._vlm_for_control["fresh"] = False
-            self._vlm_for_control["cached_from_step"] = self._cached_vlm_step
-
         self.update_memory()
-        nav_target = self.plan()
-        action = self.act_with_state_machine(
-            nav_target=nav_target,
-            vlm_report=self._vlm_for_control,
-        )
-        self._update_stuck_monitor(nav_target, action)
-        action["debug"] = self._debug_snapshot(need_vlm)
-        return action
+        target = self.plan()
+        return self.act(target)
 
-    def act_with_state_machine(
-        self,
-        *,
-        nav_target: NavigationTarget,
-        vlm_report: Optional[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-        goal = self.goal_manager.current_goal()
-        target = _target_object(vlm_report, goal)
-        target_visible = target is not None
-        self._observe_target_visibility(target, nav_target)
-
-        if self.state.mode == GOATState.SEARCH:
-            if target_visible:
-                self._enter_state(GOATState.TRACK, "target_object_visible")
-                return self.controller.approach_action(vlm_report, nav_target, goal)
-            return self.controller.search_action(nav_target)
-
-        elif self.state.mode == GOATState.TRACK:
-            if self._target_lost(max_lost_steps=4):
-                self._enter_state(GOATState.SEARCH, "target_lost_in_track")
-                return self.controller.search_action(nav_target)
-            if (
-                target_visible
-                and self.step_id >= self.state.verify_cooldown_until_step
-                and self._should_enter_verify(vlm_report, goal)
-            ):
-                self._enter_state(GOATState.VERIFY_STOP, "area_trend_verify_candidate")
-                return self.controller.verify_action(vlm_report, goal)
-            if self._tracking_stable(vlm_report) and self.state.track_hits >= 2:
-                self._enter_state(GOATState.APPROACH, "bbox_or_bearing_stable")
-                return self.controller.approach_action(vlm_report, nav_target, goal)
-            return self.controller.approach_action(vlm_report, nav_target, goal)
-
-        elif self.state.mode == GOATState.APPROACH:
-            if self._target_lost(max_lost_steps=3):
-                self._enter_state(GOATState.TRACK, "target_lost_during_approach")
-                return self.controller.search_action(nav_target)
-            if (
-                target_visible
-                and self.step_id >= self.state.verify_cooldown_until_step
-                and self._should_enter_verify(vlm_report, goal)
-            ):
-                self._enter_state(GOATState.VERIFY_STOP, "near_and_large_bbox")
-                return self.controller.verify_action(vlm_report, goal)
-            return self.controller.approach_action(vlm_report, nav_target, goal)
-
-        elif self.state.mode == GOATState.VERIFY_STOP:
-            if self.stop_verifier.observe(self.state, vlm_report, goal):
-                self._enter_state(GOATState.STOP, "multi_frame_verified")
-                return self.controller.stop_action()
-            if self.state.verify_attempts >= 6 and self.state.verify_hits == 0:
-                self.state.verify_cooldown_until_step = self.step_id + 3
-                self._enter_state(GOATState.APPROACH, "verify_failed_no_hits")
-                return self.controller.approach_action(vlm_report, nav_target, goal)
-            if self._target_lost(max_lost_steps=3):
-                self.state.verify_cooldown_until_step = self.step_id + 3
-                self._enter_state(GOATState.TRACK, "target_lost_during_verify")
-                return self.controller.search_action(nav_target)
-            return self.controller.verify_action(vlm_report, goal)
-
-        return self.controller.stop_action()
-
-    def _enter_state(self, mode: GOATState, reason: str) -> None:
-        if self.state.mode == mode:
-            return
-        self.state.mode = mode
-        self.state.transition_reason = reason
-        self.state.state_steps = 0
-        if mode == GOATState.SEARCH:
-            self.state.track_hits = 0
-            self.state.target_visible_window.clear()
-            self.state.active_object_node_id = None
-        if mode == GOATState.TRACK:
-            self.state.track_hits = 1 if self.state.target_visible_window[-1:] == [True] else 0
-        if mode == GOATState.VERIFY_STOP:
-            self.state.verify_attempts = 0
-            self.state.verify_area_window.clear()
-        else:
-            self.state.verify_window.clear()
-            self.state.verify_hits = 0
-            self.state.verify_attempts = 0
-
-    def _observe_target_visibility(
-        self,
-        target: Optional[Dict[str, Any]],
-        nav_target: NavigationTarget,
-    ) -> None:
-        target_visible = target is not None
-        self.state.state_steps += 1
-        self.state.target_visible_window.append(target_visible)
-        self.state.target_visible_window = self.state.target_visible_window[-5:]
-        if target_visible:
-            area = _bbox_area(target.get("bbox"))
-            if area > 0.0:
-                self.state.target_area_window.append(area)
-                self.state.target_area_window = self.state.target_area_window[-5:]
-                self.state.target_area_trend = _area_trend(
-                    self.state.target_area_window
-                )
-            self.state.last_goal_seen_step = self.step_id
-            self.state.target_lost_steps = 0
-            self.state.track_hits += 1
-            if nav_target.target_type == "object":
-                self.state.active_object_node_id = nav_target.node_id
-        else:
-            self.state.target_lost_steps += 1
-            self.state.track_hits = 0
-
-    def _target_lost(self, *, max_lost_steps: int) -> bool:
-        if self.state.last_goal_seen_step < 0:
+    def on_navigation_event(self, target_node_id: Optional[str], event: str) -> bool:
+        target = self._last_nav_target
+        if target_node_id is not None and target.node_id != target_node_id:
             return False
-        return self.state.target_lost_steps >= max_lost_steps
+        if event == "target_reached":
+            self._sticky_nav_target = NavigationTarget(None, None)
+            self._sticky_nav_steps = 0
+            node = self.topo_map.get_node(str(target.node_id)) if target.node_id else None
+            if node is not None:
+                node.attributes["visit_count"] = int(node.attributes.get("visit_count", 0) or 0) + 1
+                node.attributes["last_reached_step"] = self.topo_map.current_step
+                if node.node_type in (NodeType.WAYPOINT_FRONTIER, NodeType.WAYPOINT_CANDIDATE):
+                    self._start_scan(
+                        "frontier",
+                        anchor_node_id=node.node_id,
+                        structure_node_id=target.structure_node_id,
+                        steps=8,
+                    )
+                    self.topo_map.promote_frontier_to_visited(node.node_id)
+                elif target.target_type in {"object_anchor", "object_anchor_offset"}:
+                    self._start_scan(
+                        "object_anchor",
+                        anchor_node_id=node.node_id,
+                        structure_node_id=target.structure_node_id,
+                        steps=8,
+                    )
+                elif target.target_type in {"hypothesis_waypoint", "hypothesis_offset"}:
+                    self._start_scan(
+                        "hypothesis_anchor",
+                        anchor_node_id=node.node_id,
+                        structure_node_id=target.structure_node_id,
+                        steps=8,
+                    )
+                elif target.target_type == "portal_waypoint":
+                    self._start_scan(
+                        "portal_anchor",
+                        anchor_node_id=node.node_id,
+                        structure_node_id=target.structure_node_id,
+                        steps=8,
+                    )
+            if target.node_id:
+                self._target_progress.pop(str(target.node_id), None)
+                self._stale_target_until_step.pop(str(target.node_id), None)
+            self._record_history_entry(target=target, event="target_reached")
+            return True
+        if event in {"navigation_failed", "unreachable"}:
+            self._sticky_nav_target = NavigationTarget(None, None)
+            self._sticky_nav_steps = 0
+            return self.report_navigation_failed(target_node_id, unreachable=(event == "unreachable"))
+        return False
 
-    def _tracking_stable(self, vlm_report: Optional[Dict[str, Any]]) -> bool:
-        best = _target_object(vlm_report, self.goal_manager.current_goal())
-        if best is None:
+    def report_navigation_failed(self, target_node_id: Optional[str] = None, *, unreachable: bool = False) -> bool:
+        target = self._last_nav_target
+        if target_node_id is not None and target.node_id != target_node_id:
             return False
-        bbox = best.get("bbox")
-        center = _bbox_center_x(bbox)
-        if center is None:
-            return bool(vlm_report and vlm_report.get("goal_visible", False))
-        return 0.25 <= center <= 0.75
-
-    def _should_enter_verify(
-        self,
-        vlm_report: Optional[Dict[str, Any]],
-        goal: Optional[GoalNode],
-    ) -> bool:
-        best = _target_object(vlm_report, goal)
-        if best is None or goal is None:
-            return False
-
-        bbox = best.get("bbox")
-        bbox_area = _bbox_area(bbox)
-        center = _bbox_center_x(bbox)
-        range_bin = str(best.get("range_bin", "")).lower()
-        visibility = str(best.get("visibility", "")).lower()
-        bbox_confidence = str(best.get("bbox_confidence", "")).lower()
-        area_growing = self.state.target_area_trend >= 0.015
-        area_grew_over_window = (
-            len(self.state.target_area_window) >= 3
-            and self.state.target_area_window[-1]
-            >= 1.20 * max(0.01, self.state.target_area_window[0])
-        )
-        mature_memory = False
-        goal_label = str(goal.target_object or "").lower().strip()
-        for entry in self.memory.object_memory_pool.entries():
-            if entry.label.lower().strip() == goal_label and entry.seen_count >= 3:
-                mature_memory = True
-                break
+        if target.source_intent and target.source_intent.intent_type == "object" and target.structure_node_id:
+            obj = self.topo_map.get_node(target.structure_node_id)
+            if obj is not None:
+                bad = [str(x) for x in obj.attributes.get("bad_anchor_waypoint_ids", []) or []]
+                if target.node_id and target.node_id not in bad:
+                    bad.append(target.node_id)
+                obj.attributes["bad_anchor_waypoint_ids"] = bad[-8:]
+                obj.attributes["failed_count"] = int(obj.attributes.get("failed_count", 0) or 0) + 1
+                if unreachable:
+                    obj.attributes["unreachable_count"] = int(obj.attributes.get("unreachable_count", 0) or 0) + 1
         if (
-            not _range_area_close_enough_for_verify(range_bin, bbox_area)
-            or center is None
-            or not 0.15 <= center <= 0.90
-            or visibility in {"occluded", "not_visible"}
-            or bbox_confidence == "low"
-            or not (area_growing or area_grew_over_window or mature_memory)
+            target.target_type == "portal_waypoint"
+            and target.source_intent
+            and target.source_intent.intent_type == "portal"
+            and target.structure_node_id
         ):
-            return False
-        return True
-
-    def _update_stuck_monitor(
-        self,
-        nav_target: NavigationTarget,
-        action: Dict[str, Any],
-    ) -> None:
-        if self._pose is None:
-            return
-
-        current_position = self._pose.position.copy()
-        if self._last_pose_for_stuck is None:
-            self._last_pose_for_stuck = current_position
-            return
-
-        motion_delta = _distance(current_position, self._last_pose_for_stuck)
-        self.state.last_motion_delta = motion_delta
-        self._last_pose_for_stuck = current_position
-
-        action_name = str(action.get("action", ""))
-        target_id = nav_target.node_id
-        target_type = nav_target.target_type
-        can_be_stuck = (
-            self.state.mode in (GOATState.SEARCH, GOATState.TRACK, GOATState.APPROACH)
-            and action_name in {"navigate", "move_forward"}
-            and target_id is not None
-            and target_type in {"frontier", "room", "hypothesis", "object"}
-            and not bool(self._vlm_for_control and self._vlm_for_control.get("goal_visible", False))
-        )
-
-        if not can_be_stuck:
-            self._reset_stuck_monitor(clear_reason=False)
-            return
-
-        if target_id != self._stuck_monitor_target_id:
-            self._stuck_monitor_target_id = target_id
-            self._stuck_marked_target_id = None
-            self.state.stuck_steps = 0
-            self.state.stuck_target_node_id = target_id
-
-        if motion_delta < 0.03:
-            self.state.stuck_steps += 1
-        else:
-            self.state.stuck_steps = 0
-            self.state.last_stuck_reason = ""
-
-        if self.state.stuck_steps < 8:
-            return
-
-        self.state.stuck_recoveries += 1
-        self.state.last_stuck_reason = (
-            f"stuck_on_{target_type}:{target_id}; "
-            f"delta={motion_delta:.3f}; steps={self.state.stuck_steps}"
-        )
-        if target_type == "object":
-            self.memory.navigation_layer["last_failed_target"] = {
-                "node_id": target_id,
-                "target_type": target_type,
-                "failed_count": None,
-                "unreachable_count": None,
-                "reason": "object_anchor_scan_no_progress",
-                "step": self.topo_map.current_step,
-            }
-        else:
-            self.memory.mark_navigation_target_failed(
-                target_id,
-                target_type=target_type,
-                unreachable=True,
-                reason="stuck_no_progress",
+            self.topo_map.mark_structure_target_failed(
+                target.structure_node_id,
+                anchor_node_id=target.node_id,
+                target_type=target.target_type,
+                unreachable=unreachable,
+                reason="external_navigation_failed",
             )
-        self.state.stuck_steps = 0
-
-        action.clear()
-        reason = (
-            "object_anchor_scan_no_progress"
-            if target_type == "object"
-            else "stuck_recovery"
+        marked = self.topo_map.mark_navigation_target_failed(
+            target.node_id,
+            target_type=target.target_type,
+            unreachable=unreachable,
+            reason="external_navigation_failed",
         )
-        action.update(
-            {
-                "action": "turn_left",
-                "reason": reason,
-                "blocked_target_node_id": target_id,
-                "blocked_target_type": target_type,
-            }
+        if target.node_id:
+            self._target_progress.pop(str(target.node_id), None)
+            self._stale_target_until_step[str(target.node_id)] = int(self.step_id + 20)
+        self._record_history_entry(
+            target=target,
+            event="unreachable" if unreachable else "navigation_failed",
         )
+        return marked
 
-    def _reset_stuck_monitor(self, *, clear_reason: bool = True) -> None:
-        self.state.stuck_steps = 0
-        self.state.stuck_target_node_id = None
-        self._stuck_monitor_target_id = None
-        self._stuck_marked_target_id = None
-        if clear_reason:
-            self.state.last_stuck_reason = ""
-
-    def _debug_snapshot(self, need_vlm: bool) -> Dict[str, Any]:
-        return {
+    def _debug_snapshot(self) -> Dict[str, Any]:
+        state_debug = self.state_machine.debug()
+        intents = [self.structure_planner.debug_intent(intent) for intent in self.structure_planner.last_intents[:8]]
+        nav_props = [self.navigation_planner.debug_proposal(p) for p in self.navigation_planner.last_proposals[:8]]
+        selected_intent = self.structure_planner.debug_intent(self._last_intent) if self._last_intent else {}
+        selected_target = self.navigation_planner.debug_target(self._last_nav_target)
+        map_audit = self._build_map_audit_context(nav_props)
+        debug = {
+            **state_debug,
             "step_id": self.step_id,
-            "state": self.state.mode.value,
-            "transition_reason": self.state.transition_reason,
-            "state_steps": self.state.state_steps,
-            "clip_room": self._last_clip_hint.room_label,
-            "clip_goal_sim": self._last_clip_hint.best_goal_sim,
-            "need_vlm": need_vlm,
-            "vlm_reason": self.perception.last_vlm_reason,
-            "fresh_vlm": bool(self._fresh_vlm_report),
-            "cached_vlm_step": self._cached_vlm_step,
-            "using_cached_vlm": bool(
-                self._vlm_for_control is not None
-                and self._fresh_vlm_report is None
-            ),
-            "vlm_goal_visible": bool(
-                self._vlm_for_control and self._vlm_for_control.get("goal_visible", False)
-            ),
-            "target_visible_window": list(self.state.target_visible_window),
-            "target_area_window": [
-                round(float(area), 4) for area in self.state.target_area_window
-            ],
-            "target_area_trend": round(float(self.state.target_area_trend), 4),
-            "verify_area_window": [
-                round(float(area), 4) for area in self.state.verify_area_window
-            ],
-            "track_hits": self.state.track_hits,
-            "target_lost_steps": self.state.target_lost_steps,
-            "last_goal_seen_step": self.state.last_goal_seen_step,
-            "active_object_node_id": self.state.active_object_node_id,
-            "hypothesis_count": len(self.memory.hypothesis_pool),
-            "active_hypotheses": self.memory.hypothesis_pool.to_debug(
-                self.topo_map.current_step
-            ),
-            "object_memory_count": len(self.memory.object_memory_pool),
-            "object_memory": self.memory.object_memory_pool.to_debug(),
-            "proposal_count": len(self._last_proposals),
-            "proposal_debug": dict(self.proposal_builder.last_debug),
-            "selected_proposal": (
-                self.proposal_builder._proposal_debug(self._last_nav_target.proposal)
-                if self._last_nav_target.proposal is not None
-                else None
-            ),
+            "perception": dict(self._cur_perception or self._perception_debug(False)),
+            "memory": self._memory_debug(),
+            "structure_intents": intents,
+            "selected_intent": selected_intent,
+            "navigation_proposals": nav_props,
+            "selected_navigation_target": selected_target,
+            "navigation_sticky": {
+                "node_id": self._sticky_nav_target.node_id,
+                "steps": int(self._sticky_nav_steps),
+            },
+            "visual_sweep": {
+                "remaining_steps": int(self._visual_scan_steps),
+                "force_vlm_scan_steps": int(self._force_vlm_scan_steps),
+                "goal_visible_vlm_steps": int(self._goal_visible_vlm_steps),
+            },
+            "scan_context": self._scan_context.to_dict(),
+            "frontier_rejected": list(getattr(self.memory, "last_frontier_rejected", [])),
+            "reachability_probe": dict(self._last_reachability_probe),
+            "planning_context": {
+                "recent_target_counts": dict(self._last_planning_context.recent_target_counts),
+                "stale_target_ids": dict(self._last_planning_context.stale_target_ids),
+                "current_waypoint_id": self._last_planning_context.current_waypoint_id,
+                "trajectory": list(self._last_planning_context.trajectory),
+                "recent_failures": list(self._last_planning_context.recent_failures),
+            },
+            "map_audit": map_audit,
+            "stop_verifier": dict(self.state_machine.stop_verifier.last_debug),
+            "active_topo": self._active_view.stats(),
+            "active_topo_nodes": self._active_view.state_buckets(),
+            "verify_events": {
+                "needs_verify_now": bool(self._last_needs_verify),
+                "success_count": int(self._verify_success_count),
+                "fail_count": int(self._verify_fail_count),
+            },
+            "recovery": {
+                "level": int(self._recovery.level),
+                "exhausted_regions": len(self._recovery.exhausted_regions),
+                "steps_since_progress": int(self.step_id - self._recovery_ref_step),
+            },
             "target_node_id": self._last_nav_target.node_id,
             "target_type": self._last_nav_target.target_type,
-            "verify_hits": self.state.verify_hits,
-            "verify_attempts": self.state.verify_attempts,
-            "verify_cooldown_until_step": self.state.verify_cooldown_until_step,
-            "stuck_steps": self.state.stuck_steps,
-            "stuck_recoveries": self.state.stuck_recoveries,
-            "stuck_target_node_id": self.state.stuck_target_node_id,
-            "last_motion_delta": self.state.last_motion_delta,
-            "last_stuck_reason": self.state.last_stuck_reason,
-            "last_failed_target": dict(
-                self.memory.navigation_layer.get("last_failed_target", {})
+        }
+        self._last_debug = debug
+        return debug
+
+    def _perception_debug(self, need_vlm: bool) -> Dict[str, Any]:
+        report = self._vlm_report or self._clip_report
+        raw = report.raw if isinstance(report.raw, dict) else {}
+        raw_objects = raw.get("objects", [])
+        if not isinstance(raw_objects, list):
+            raw_objects = []
+        normalized_objects = [obj.to_dict() for obj in report.objects[:8]]
+        raw_text = str(raw.get("_raw_text_truncated", ""))
+        parse_status = {
+            "query_ok": bool(raw.get("_query_ok", True)),
+            "parse_ok": bool(raw.get("_parse_ok", True)),
+            "error": str(raw.get("_error", "")),
+            "raw_has_json": bool(raw_objects or "{" in raw_text or bool(raw.get("_parse_ok", False))),
+            "raw_object_count": len(raw_objects),
+            "normalized_object_count": len(report.objects),
+            "objects_with_bbox": sum(1 for obj in normalized_objects if obj.get("bbox")),
+            "objects_with_display_bbox": sum(
+                1
+                for obj in normalized_objects
+                if obj.get("display_bbox") or (obj.get("attributes") or {}).get("display_bbox")
             ),
+        }
+        return {
+            "room_label": self._clip_report.room_label,
+            "room_confidence": float(self._clip_report.room_confidence),
+            "best_goal_sim": float(self._clip_report.best_goal_sim),
+            "best_landmark_sim": float(self._clip_report.best_landmark_sim),
+            "room_scores": _score_items(self._clip_report.room_scores),
+            "goal_scores": _score_items(self._clip_report.goal_scores),
+            "landmark_scores": _score_items(self._clip_report.landmark_scores),
+            "need_vlm": bool(need_vlm),
+            "fresh_vlm": bool(self._vlm_report is not None and self._vlm_report.is_full),
+            "vlm_reason": self.perception.last_vlm_reason,
+            "vlm_goal_visible": bool(report.goal_visible),
+            "vlm_object_count": len(report.objects),
+            "vlm_objects": normalized_objects,
+            "vlm_parse_status": parse_status,
+            "vlm_goal_reason": str(raw.get("goal_reason", "")),
+            "vlm_scene_summary": str(raw.get("scene_summary", "")),
+            "vlm_recommended_action": str(raw.get("recommended_action", "")),
+            "vlm_raw_text": raw_text,
+        }
+
+    def _memory_debug(self) -> Dict[str, Any]:
+        structure_nodes = self.topo_map.structure_layer.nodes()
+        navigation_nodes = self.topo_map.navigation_layer.nodes()
+        base = self.memory.to_debug()
+        base.update({
+            "structure_layer": {
+                "total": len(structure_nodes),
+                "rooms": sum(1 for n in structure_nodes if n.node_type == NodeType.ROOM),
+                "objects": sum(1 for n in structure_nodes if n.node_type == NodeType.OBJECT),
+                "landmarks": sum(1 for n in structure_nodes if n.node_type == NodeType.LANDMARK),
+                "portals": sum(1 for n in structure_nodes if n.node_type == NodeType.PORTAL),
+            },
+            "navigation_layer": {
+                "total": len(navigation_nodes),
+                "visited_waypoints": sum(1 for n in navigation_nodes if n.node_type == NodeType.WAYPOINT_VISITED),
+                "frontiers": sum(1 for n in navigation_nodes if n.node_type == NodeType.WAYPOINT_FRONTIER),
+                "candidate_waypoints": sum(1 for n in navigation_nodes if n.node_type == NodeType.WAYPOINT_CANDIDATE),
+                "approach_waypoints": sum(1 for n in navigation_nodes if n.node_type == NodeType.WAYPOINT_APPROACH),
+            },
+            "cross_layer_links": len(self.topo_map.cross_layer.edges()),
+            "frontier_rejected": list(getattr(self.memory, "last_frontier_rejected", [])),
+            "frontier_probes": list(getattr(self.memory, "last_frontier_probes", [])),
+        })
+        return base
+
+    def _build_map_audit_context(self, current_options: List[Dict[str, Any]]) -> Dict[str, Any]:
+        option_by_id = {
+            str(item.get("target_node_id")): item
+            for item in current_options
+            if item.get("target_node_id") is not None
+        }
+        map_edges = []
+        for src, dst, data in self.topo_map.navigation_layer.edges():
+            map_edges.append({
+                "source": src,
+                "target": dst,
+                "type": data.get("edge_type", ""),
+                "edge_types": list(data.get("edge_types", [])),
+                "blocked": bool(data.get("blocked", False)),
+                "weight": float(data.get("weight", 1.0)),
+            })
+        supplementary = []
+        for node in self.topo_map.navigation_layer.nodes():
+            if node.node_type not in (
+                NodeType.WAYPOINT_FRONTIER,
+                NodeType.WAYPOINT_CANDIDATE,
+                NodeType.WAYPOINT_APPROACH,
+            ):
+                continue
+            if node.attributes.get("blocked", False) or node.attributes.get("consumed", False):
+                continue
+            option = option_by_id.get(node.node_id, {})
+            stale_until = self._stale_target_until_step.get(node.node_id)
+            supplementary.append({
+                "node_id": node.node_id,
+                "type": node.node_type.value,
+                "position": node.position.round(4).tolist(),
+                "score": float(option.get("score", node.confidence)),
+                "confidence": float(node.confidence),
+                "failed_count": int(node.attributes.get("failed_count", 0) or 0),
+                "unreachable_count": int(node.attributes.get("unreachable_count", 0) or 0),
+                "visit_count": int(node.attributes.get("visit_count", node.visit_count) or 0),
+                "stale_until_step": stale_until,
+                "reachability": node.attributes.get("reachability", ""),
+                "geodesic_distance": node.attributes.get("geodesic_distance"),
+                "frontier_source": node.attributes.get("frontier_source", ""),
+                "direction_label": node.attributes.get("direction_label", ""),
+                "semantic_value": float(node.attributes.get("semantic_value", 0.0) or 0.0),
+                "expected_room_probs": dict(node.attributes.get("expected_room_probs", {}) or {}),
+                "visual_semantic_reason": node.attributes.get("visual_semantic_reason", ""),
+                "reason": str(option.get("reason", node.attributes.get("source", ""))),
+            })
+        supplementary.sort(key=lambda item: float(item.get("score", 0.0)), reverse=True)
+        audit = MapAuditContext(
+            trajectory=self._trajectory_ids(),
+            map_edges=map_edges[-96:],
+            supplementary_candidates=supplementary[:16],
+            current_options=current_options[:12],
+            recent_failures=list(self.topo_map.failed_target_history[-8:]),
+        )
+        return {
+            "trajectory": audit.trajectory,
+            "map_edges": audit.map_edges,
+            "supplementary_candidates": audit.supplementary_candidates,
+            "current_options": audit.current_options,
+            "recent_failures": audit.recent_failures,
         }
 
 
 def _goal_text(goal: GoalNode) -> str:
-    parts = [
-        str(goal.description or "").strip(),
-        " ".join(str(attr) for attr in goal.attributes or []),
-        str(goal.target_object or "").strip(),
-    ]
-    return " ".join(part for part in parts if part)
-
-
-def _goal_id(goal: GoalNode) -> str:
-    return str(goal.image_cache_key or goal.goal_image_id or goal.target_object)
-
-
-def _best_label(scores: List[Any]) -> Optional[str]:
-    if not scores:
-        return None
-    return str(scores[0][0])
-
-
-def _distance(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.linalg.norm(np.asarray(a, dtype=np.float32) - np.asarray(b, dtype=np.float32)))
-
-
-def _estimate_object_position(pose: AgentPose, obj: Dict[str, Any]) -> np.ndarray:
-    range_bin = str(obj.get("range_bin", "unknown")).lower().strip()
-    forward_distance = _range_bin_distance(range_bin)
-
-    bbox_center = _bbox_center_x(obj.get("bbox"))
-    if bbox_center is None:
-        bearing = str(obj.get("bearing", "")).lower().strip()
-        if bearing == "left":
-            lateral_fraction = -0.45
-        elif bearing == "right":
-            lateral_fraction = 0.45
-        else:
-            lateral_fraction = 0.0
-    else:
-        lateral_fraction = float(np.clip((bbox_center - 0.5) * 1.4, -0.75, 0.75))
-
-    heading = float(pose.heading)
-    forward = np.array(
-        [-np.sin(heading), 0.0, -np.cos(heading)],
-        dtype=np.float32,
-    )
-    right = np.array(
-        [np.cos(heading), 0.0, -np.sin(heading)],
-        dtype=np.float32,
-    )
-    lateral_distance = lateral_fraction * max(0.4, forward_distance * 0.8)
-    estimate = (
-        pose.position
-        + forward * forward_distance
-        + right * lateral_distance
-    ).astype(np.float32)
-    estimate[1] = 0.0
-    return estimate
-
-
-def _range_bin_distance(range_bin: str) -> float:
-    if range_bin in {"very_near", "close"}:
-        return 0.6
-    if range_bin == "near":
-        return 1.35
-    if range_bin in {"mid", "medium"}:
-        return 2.2
-    if range_bin == "far":
-        return 3.2
-    return 1.5
-
-
-def _range_area_close_enough_for_verify(range_bin: str, bbox_area: float) -> bool:
-    if range_bin in {"very_near", "close"}:
-        return bbox_area >= 0.05
-    if range_bin == "near":
-        return bbox_area >= 0.14
-    return False
-
-
-def _range_area_close_enough_for_stop(range_bin: str, bbox_area: float) -> bool:
-    if range_bin in {"very_near", "close"}:
-        return bbox_area >= 0.06
-    if range_bin == "near":
-        return bbox_area >= 0.20
-    return False
-
-
-def _vlm_report_to_dict(report: PerceptionReport, *, reason: str, mode: str) -> Dict[str, Any]:
-    return {
-        "fresh": True,
-        "step": int(report.step_id),
-        "mode": mode,
-        "trigger_reason": reason,
-        "room": report.room_label,
-        "room_confidence": float(report.room_confidence),
-        "goal_visible": bool(report.goal_visible),
-        "goal_match_confidence": float(report.goal_match_confidence),
-        "target_direction": report.target_direction,
-        "target_visibility": report.target_visibility,
-        "apparent_scale": report.apparent_scale,
-        "stop_candidate": bool(report.stop_candidate),
-        "recommended_action": report.recommended_action,
-        "goal_reason": report.goal_reason,
-        "objects": [obj.to_dict() for obj in report.objects],
-        "landmarks": list(report.portals),
-        "raw": dict(report.raw),
-    }
-
-
-def _target_object(
-    vlm_report: Optional[Dict[str, Any]],
-    goal: Optional[GoalNode],
-) -> Optional[Dict[str, Any]]:
-    if not vlm_report or goal is None:
-        return None
-    goal_label = str(goal.target_object or "").lower().strip()
-    objects = [dict(obj) for obj in vlm_report.get("objects", []) if obj]
-    matched = [
-        obj
-        for obj in objects
-        if str(obj.get("label", "")).lower().strip() == goal_label
-    ]
-    if matched:
-        return max(matched, key=lambda obj: float(obj.get("confidence", 0.0) or 0.0))
-
-    if bool(vlm_report.get("goal_visible", False)) and objects:
-        goal_match_confidence = float(vlm_report.get("goal_match_confidence", 0.0) or 0.0)
-        visible_objects = [
-            obj
-            for obj in objects
-            if str(obj.get("visibility", "")).lower() not in {"occluded", "not_visible"}
+    return " ".join(
+        part
+        for part in [
+            str(goal.description or "").strip(),
+            str(goal.target_object or "").strip(),
+            " ".join(str(attr) for attr in goal.attributes or []),
         ]
-        candidates = visible_objects or objects
-        if len(candidates) == 1 or goal_match_confidence >= 0.5:
-            return max(candidates, key=lambda obj: float(obj.get("confidence", 0.0) or 0.0))
-    return None
+        if part
+    )
 
 
-def _target_bbox(
-    vlm_report: Optional[Dict[str, Any]],
-    goal: Optional[GoalNode],
-) -> Optional[Any]:
-    target = _target_object(vlm_report, goal)
-    return None if target is None else target.get("bbox")
+def _goal_alias_text(goal: Optional[GoalNode]) -> str:
+    if goal is None:
+        return ""
+    key = str(goal.target_object or "").lower().strip().replace("_", " ")
+    aliases = {
+        "rack": [
+            "rack", "clothes rack", "coat rack", "towel rack", "shelf",
+            "shelving", "storage shelf", "wooden shelf", "shelf rack",
+            "bookcase",
+        ],
+        "bed": ["bed", "mattress", "bunk bed"],
+        "heater": ["heater", "radiator", "baseboard heater", "space heater"],
+        "sofa": ["sofa", "couch", "loveseat"],
+        "tv": ["tv", "television", "monitor", "screen"],
+        "sink": ["sink", "basin", "washbasin"],
+    }
+    values = aliases.get(key, [key] if key else [])
+    return ", ".join(values)
 
 
-def _bbox_area(bbox: Any) -> float:
-    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
-        return 0.0
-    try:
-        x1, y1, x2, y2 = [float(value) for value in bbox]
-    except (TypeError, ValueError):
-        return 0.0
-    if x2 <= x1 or y2 <= y1:
-        return 0.0
-    return max(0.0, min(1.0, (x2 - x1) * (y2 - y1)))
-
-
-def _bbox_center_x(bbox: Any) -> Optional[float]:
-    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
-        return None
-    try:
-        x1, _y1, x2, _y2 = [float(value) for value in bbox]
-    except (TypeError, ValueError):
-        return None
-    return 0.5 * (x1 + x2)
-
-
-def _area_trend(areas: List[float]) -> float:
-    valid = [float(area) for area in areas if area > 0.0]
-    if len(valid) < 2:
-        return 0.0
-    return float(valid[-1] - valid[0])
+def _score_items(scores: Any) -> list[dict[str, float | str]]:
+    out: list[dict[str, float | str]] = []
+    for item in scores or []:
+        if isinstance(item, dict):
+            label = item.get("label", item.get("name", "n/a"))
+            score = item.get("score", item.get("confidence", 0.0))
+        else:
+            try:
+                label, score = item
+            except (TypeError, ValueError):
+                label, score = str(item), 0.0
+        try:
+            score_f = float(score)
+        except (TypeError, ValueError):
+            score_f = 0.0
+        out.append({"label": str(label), "score": score_f})
+    return out
 
 
 ConfTopoGOATAgent = GOATAgent
 
 
 __all__ = [
-    "AgentPose",
-    "AgentState",
-    "ClipHint",
-    "Controller",
-    "GOATAgent",
-    "GOATState",
-    "GoalManager",
-    "Hypothesis",
-    "HypothesisPool",
-    "MemoryManager",
-    "NavigationTarget",
-    "ObjectMemoryEntry",
-    "ObjectMemoryPool",
-    "PerceptionModule",
-    "Planner",
-    "ProposalBuilder",
-    "StopVerifier",
+    "Agent1MemoryWriter",
+    "Agent1Perception",
     "ConfTopoGOATAgent",
+    "GOATAgent",
+    "GoalManager",
+    "NavigationPlanner",
+    "StructurePlanner",
 ]

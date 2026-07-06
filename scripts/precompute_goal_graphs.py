@@ -381,7 +381,8 @@ def main():
     )
     parser.add_argument(
         "--clip-cache",
-        default=str(DATA_ROOT.parent / "models" / "clip"),
+        default=str(DATA_ROOT.parent / "clip"),
+        help="Directory containing CLIP weights. Defaults to <workspace>/clip/ where ViT-B-32.pt lives.",
     )
     parser.add_argument("--no-train", action="store_true")
     parser.add_argument(

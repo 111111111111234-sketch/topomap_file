@@ -46,7 +46,7 @@ class PerceptionReport:
     stop_candidate: bool = False
     recommended_action: str = "search"
     goal_reason: str = ""
-    portals: List[str] = field(default_factory=list)
+    portals: List[Dict[str, Any]] = field(default_factory=list)
     uncertainty: float = 0.0
 
     # --- Meta ---
@@ -80,7 +80,7 @@ class PerceptionReport:
             "stop_candidate": self.stop_candidate,
             "recommended_action": self.recommended_action,
             "goal_reason": self.goal_reason,
-            "portals": list(self.portals),
+            "portals": [dict(p) if isinstance(p, dict) else {"label": str(p)} for p in self.portals],
             "uncertainty": float(self.uncertainty),
             "visual_embed": (
                 self.visual_embed.tolist() if self.visual_embed is not None else None
@@ -120,7 +120,10 @@ class PerceptionReport:
             stop_candidate=bool(data.get("stop_candidate", False)),
             recommended_action=str(data.get("recommended_action", "search")),
             goal_reason=str(data.get("goal_reason", "")),
-            portals=[str(p) for p in data.get("portals", [])],
+            portals=[
+                dict(p) if isinstance(p, dict) else {"label": str(p)}
+                for p in data.get("portals", [])
+            ],
             uncertainty=float(data.get("uncertainty", 0.0)),
             visual_embed=(
                 np.array(embed, dtype=np.float32) if embed is not None else None

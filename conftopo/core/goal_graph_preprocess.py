@@ -582,6 +582,9 @@ def resolve_clip_pretrained(clip_cache: Path) -> str:
         clip_cache / "ViT-B-32-laion2b_s34b_b79k.bin",
         clip_cache / "open_clip_pytorch_model.bin",
         clip_cache.parent / "clip" / "ViT-B-32-laion2b_s34b_b79k.bin",
+        # OpenAI .pt format — open_clip accepts a file path as pretrained
+        clip_cache / "ViT-B-32.pt",
+        clip_cache.parent / "clip" / "ViT-B-32.pt",
     ]
     for path in candidates:
         if path.is_file():
@@ -732,9 +735,16 @@ def embed_goal_graphs(
     pretrained = resolve_clip_pretrained(clip_cache)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model, _, preprocess = open_clip.create_model_and_transforms(
-        "ViT-B-32", pretrained=pretrained, cache_dir=str(clip_cache),
-    )
+    # open_clip loading OpenAI .pt (TorchScript archive) requires weights_only=False.
+    # Patch torch.load temporarily so open_clip can load the local file without error.
+    _orig_torch_load = torch.load
+    torch.load = lambda *a, **kw: _orig_torch_load(*a, **dict(kw, weights_only=False))
+    try:
+        model, _, preprocess = open_clip.create_model_and_transforms(
+            "ViT-B-32", pretrained=pretrained, cache_dir=str(clip_cache),
+        )
+    finally:
+        torch.load = _orig_torch_load
     model = model.to(device).eval()
     tokenizer = open_clip.get_tokenizer("ViT-B-32")
 

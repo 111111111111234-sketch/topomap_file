@@ -1,0 +1,184 @@
+# ============================================================
+# 🎯 GoatAgent 完整测试流程 - 按顺序执行
+# ============================================================
+
+## ============================================================
+## 📍 第一步：环境初始化（5秒）
+## ============================================================
+
+conda activate goat && cd /workspace/tangyx7@xiaopeng.com && export PYTHONPATH=$PWD
+
+# ✅ 完成标志：提示符变为 (goat)
+
+
+## ============================================================
+## 📍 第二步：语法验证（10秒）
+## ============================================================
+
+python3 -m py_compile \
+  conftopo/core/confidence.py \
+  conftopo/core/instruction_graph.py \
+  conftopo/core/hypothesis_pool.py \
+  conftopo/core/object_memory_pool.py \
+  conftopo/core/dynamic_topo_map.py \
+  conftopo/agents/goat_agent_new.py && echo "✅ 语法检查通过"
+
+# ✅ 完成标志：显示 "✅ 语法检查通过"
+
+
+## ============================================================
+## 📍 第三步：单元测试（2-3分钟）
+## ============================================================
+
+python3 -m pytest conftopo/tests/test_goat_agent_new.py -v
+
+# ✅ 完成标志：显示 "passed" 或具体的测试结果
+
+
+## ============================================================
+## 📍 第四步：启动 VLM 服务【新开终端窗口】（2-3分钟启动）
+## ============================================================
+
+# 🚨 重要：在新的终端窗口执行，不要关闭
+
+conda activate vllm && \
+vllm serve /root/.cache/huggingface/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b \
+  --served-model-name Qwen/Qwen3-VL-8B-Instruct \
+  --dtype auto \
+  --limit-mm-per-prompt '{"image": 1}' \
+  --max-model-len 4096 \
+  --port 8000
+
+# ✅ 完成标志：看到
+#   INFO:     Application startup complete
+#   Uvicorn running on http://0.0.0.0:8000
+#   Model already loaded (...)
+
+
+## ============================================================
+## 📍 第五步：验证 VLM 连接【回到原来的终端】
+## ============================================================
+
+curl http://localhost:8000/v1/models
+
+# ✅ 完成标志：输出包含 "Qwen/Qwen3-VL-8B-Instruct"
+# 示例输出：
+# {
+#   "object": "list",
+#   "data": [
+#     {
+#       "id": "Qwen/Qwen3-VL-8B-Instruct",
+#       "object": "model",
+#       "owned_by": "vllm",
+#       "permission": []
+#     }
+#   ]
+# }
+
+
+## ============================================================
+## 📍 第六步：正式 Smoke Test（1-2分钟）
+## ============================================================
+
+# 🚨 确保 VLM 服务在第四步已启动！
+
+python3 << 'EOF'
+import sys
+import numpy as np
+from conftopo.agents.goat_agent_new import GoatAgent
+from conftopo.core.instruction_graph import GoalNode, Relation
+
+print("\n" + "="*70)
+print("🚀 GoatAgent Pipeline Smoke Test (Real VLM)")
+print("="*70)
+
+try:
+    print("\n[1/6] 创建 GoatAgent 实例...")
+    agent = GoatAgent()
+    print("      ✅ Agent 创建成功")
+    
+    print("\n[2/6] 设置导航目标...")
+    goal = GoalNode(
+        target_object="chair",
+        attributes=["red"],
+        room_prior=["dining room"],
+        landmarks=["table"],
+        relations=[Relation("near", "table")],
+    )
+    agent.set_new_goal(goal)
+    print(f"      ✅ Goal 设置完成")
+    print(f"         target_object: {goal.target_object}")
+    print(f"         attributes: {goal.attributes}")
+    print(f"         room_prior: {goal.room_prior}")
+    
+    print("\n[3/6] 观测环境 (Observe)...")
+    obs = {
+        "rgb": None,
+        "rgb_embed": np.random.rand(512).astype("float32"),
+        "position": np.array([0.0, 0.0, 0.0], dtype="float32"),
+        "heading": 0.0,
+    }
+    agent.observe(obs)
+    print(f"      ✅ 观测完成")
+    print(f"         position: {obs['position']}")
+    print(f"         heading: {obs['heading']}")
+    
+    print("\n[4/6] 更新记忆 (Update Memory)...")
+    agent.update_memory()
+    print("      ✅ 记忆更新完成")
+    
+    print("\n[5/6] 生成计划 (Plan)...")
+    plan = agent.plan()
+    print(f"      ✅ 计划生成完成")
+    print(f"         plan type: {type(plan)}")
+    print(f"         plan value: {plan}")
+    
+    print("\n[6/6] 执行动作 (Act)...")
+    action_output = agent.act(plan)
+    print(f"      ✅ 动作执行完成")
+    print(f"         output: {action_output}")
+    
+    print("\n" + "="*70)
+    print("📊 Agent 统计信息:")
+    print("="*70)
+    stats = agent.memory_stats()
+    if stats:
+        for key, value in stats.items():
+            print(f"      {key}: {value}")
+    else:
+        print("      (无统计信息)")
+    
+    print("\n" + "="*70)
+    print("✅✅✅ 所有测试通过！Pipeline 可以正常运行 ✅✅✅")
+    print("="*70 + "\n")
+    
+except Exception as e:
+    print(f"\n❌ 测试失败！")
+    print(f"   错误类型: {type(e).__name__}")
+    print(f"   错误信息: {e}\n")
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)
+
+EOF
+
+# ✅ 完成标志：
+# - 无报错
+# - 输出 "✅✅✅ 所有测试通过！Pipeline 可以正常运行 ✅✅✅"
+
+
+## ============================================================
+## ✨ 测试完成！
+## ============================================================
+
+# 如果全部完成，说明：
+# ✅ 语法无问题
+# ✅ 单元测试通过
+# ✅ VLM 服务正常
+# ✅ Agent Pipeline 可以正常运行 (observe -> plan -> act)
+# ✅ 内存统计正常
+
+# 下一步：
+# - 接入真实的环境和数据
+# - 运行更完整的集成测试
+# - 调整参数和配置

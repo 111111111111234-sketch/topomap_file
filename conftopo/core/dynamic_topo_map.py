@@ -28,17 +28,19 @@ class NodeType(Enum):
     WAYPOINT_CANDIDATE = "waypoint_candidate"
     WAYPOINT_APPROACH = "waypoint_approach"
     LANDMARK = "landmark"
+    PORTAL = "portal"
     OBJECT = "object"
     ROOM = "room"
-    OBJECT_SUMMARY = "object_summary"
-    GOAL_REGION = "goal_region"
+    SEMANTIC_RELATION = "semantic_relation"
 
 
 class EdgeType(Enum):
     NAVIGABLE = "navigable"
-    OBSERVED_AT = "observed_at"
-    BELONGS_TO = "belongs_to"
-    VISIBLE_FROM = "visible_from"
+    BLOCKED = "blocked"
+    OBSERVED_FROM = "observed_from"
+    CONTAINS = "contains"
+    CONTAINS_OBJECT = "contains_object"
+    CONNECTS = "connects"
     ADJACENT_TO = "adjacent_to"  # traversable link in semantic-structural layer
     IN_ROOM = "in_room"          # object is located in this room
     NEAR = "near"                # object is spatially near another object/landmark
@@ -61,6 +63,90 @@ class SemanticNode:
     step_id: int = 0  # when this node was created/last updated
     visit_count: int = 0
     attributes: Dict[str, Any] = field(default_factory=dict)
+
+
+class StructureLayer:
+    """Typed facade over structure-layer nodes stored in DynamicTopoMap."""
+
+    def __init__(self, topo_map: "DynamicTopoMap"):
+        self.topo_map = topo_map
+
+    def nodes(self) -> List[SemanticNode]:
+        return self.topo_map.structure_layer_nodes()
+
+    def edges(self) -> List[Tuple[str, str, Dict[str, Any]]]:
+        return self.topo_map.structure_layer_edges()
+
+    def add_or_update_room_region(self, *args, **kwargs) -> Optional[str]:
+        return self.topo_map.add_or_update_room_region(*args, **kwargs)
+
+    def add_or_update_object_memory_node(self, *args, **kwargs) -> str:
+        return self.topo_map.add_or_update_object_memory_node(*args, **kwargs)
+
+    def add_or_update_landmark_node(self, *args, **kwargs) -> str:
+        return self.topo_map.add_or_update_landmark_node(*args, **kwargs)
+
+    def add_or_update_portal_node(self, *args, **kwargs) -> str:
+        return self.topo_map.add_or_update_portal_node(*args, **kwargs)
+
+    def add_semantic_relation(self, *args, **kwargs) -> str:
+        return self.topo_map.add_semantic_relation(*args, **kwargs)
+
+
+class NavigationLayer:
+    """Typed facade over executable navigation nodes and edges."""
+
+    def __init__(self, topo_map: "DynamicTopoMap"):
+        self.topo_map = topo_map
+
+    def nodes(self) -> List[SemanticNode]:
+        return self.topo_map.navigation_layer_nodes()
+
+    def edges(self) -> List[Tuple[str, str, Dict[str, Any]]]:
+        return self.topo_map.navigation_layer_edges()
+
+    def add_or_update_waypoint(self, *args, **kwargs) -> str:
+        return self.topo_map.add_or_update_waypoint(*args, **kwargs)
+
+    def add_or_update_frontier(self, *args, **kwargs) -> str:
+        return self.topo_map.add_or_update_frontier(*args, **kwargs)
+
+    def mark_failed(self, *args, **kwargs) -> bool:
+        return self.topo_map.mark_navigation_target_failed(*args, **kwargs)
+
+    def add_candidate_node(self, *args, **kwargs) -> str:
+        return self.topo_map.add_candidate_node(*args, **kwargs)
+
+    def mark_edge_blocked(self, *args, **kwargs) -> bool:
+        return self.topo_map.mark_edge_blocked(*args, **kwargs)
+
+
+class CrossLayerLinks:
+    """Facade for bindings between semantic evidence and executable nodes."""
+
+    def __init__(self, topo_map: "DynamicTopoMap"):
+        self.topo_map = topo_map
+
+    def bind_object_to_anchor(self, object_id: str, waypoint_id: str) -> None:
+        self.topo_map.bind_object_to_anchor(object_id, waypoint_id)
+
+    def bind_object_observation(self, object_id: str, waypoint_id: str) -> None:
+        self.topo_map.bind_object_observation(object_id, waypoint_id)
+
+    def bind_room_member(self, room_id: str, waypoint_id: str) -> None:
+        self.topo_map.bind_room_member(room_id, waypoint_id)
+
+    def bind_room_contains_object(self, room_id: str, object_id: str) -> None:
+        self.topo_map.bind_room_contains_object(room_id, object_id)
+
+    def bind_landmark_observation(self, landmark_id: str, waypoint_id: str) -> None:
+        self.topo_map.bind_landmark_observation(landmark_id, waypoint_id)
+
+    def bind_portal_connection(self, portal_id: str, node_id: str) -> None:
+        self.topo_map.bind_portal_connection(portal_id, node_id)
+
+    def edges(self) -> List[Tuple[str, str, Dict[str, Any]]]:
+        return self.topo_map.cross_layer_edges()
 
 
 def _bbox_iou(a, b) -> float:
@@ -104,6 +190,105 @@ def _angle_delta(a: float, b: float) -> float:
 def _normalize_angle(angle: float) -> float:
     """Normalize angle to [-pi, pi]."""
     return float((angle + np.pi) % (2 * np.pi) - np.pi)
+
+
+def _label_key(label: Any) -> str:
+    return str(label or "").strip().lower().replace("_", " ")
+
+
+def _normalizable_score_dict(scores: Any) -> Dict[str, float]:
+    if isinstance(scores, dict):
+        items = scores.items()
+    elif isinstance(scores, (list, tuple)):
+        items = scores
+    else:
+        return {}
+    out: Dict[str, float] = {}
+    for item in items:
+        try:
+            label, score = item
+            label_key = str(label).strip()
+            if not label_key:
+                continue
+            out[label_key] = float(score)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _normalize_probs(scores: Dict[str, float]) -> Dict[str, float]:
+    clean = {str(k): max(0.0, float(v)) for k, v in scores.items()}
+    total = float(sum(clean.values()))
+    if total <= 1e-8:
+        return {}
+    return {k: float(v / total) for k, v in clean.items()}
+
+
+def _prob_similarity(a: Dict[str, float], b: Dict[str, float]) -> float:
+    if not a or not b:
+        return 0.0
+    keys = set(a.keys()) | set(b.keys())
+    if not keys:
+        return 0.0
+    dot = 0.0
+    na = 0.0
+    nb = 0.0
+    for key in keys:
+        va = float(a.get(key, 0.0))
+        vb = float(b.get(key, 0.0))
+        dot += va * vb
+        na += va * va
+        nb += vb * vb
+    if na <= 1e-8 or nb <= 1e-8:
+        return 0.0
+    return float(dot / (math.sqrt(na) * math.sqrt(nb)))
+
+
+def _dedupe_list(values: List[Any]) -> List[str]:
+    seen = set()
+    out = []
+    for value in values:
+        text = str(value).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
+def _room_evidence_from_object_label(label: Any) -> Dict[str, float]:
+    key = str(label or "").lower().strip()
+    if not key:
+        return {}
+    strong = {
+        "bed": {"bedroom": 0.10},
+        "pillow": {"bedroom": 0.08},
+        "wardrobe": {"bedroom": 0.08},
+        "sink": {"bathroom": 0.08, "kitchen": 0.04},
+        "toilet": {"bathroom": 0.12},
+        "bathtub": {"bathroom": 0.12},
+        "shower": {"bathroom": 0.10},
+        "refrigerator": {"kitchen": 0.12},
+        "fridge": {"kitchen": 0.12},
+        "oven": {"kitchen": 0.10},
+        "stove": {"kitchen": 0.10},
+        "sofa": {"living room": 0.08},
+        "couch": {"living room": 0.08},
+        "tv": {"living room": 0.06},
+        "television": {"living room": 0.06},
+        "bookshelf": {"office": 0.05, "living room": 0.04},
+    }
+    weak = {
+        "chair": {"dining room": 0.025, "office": 0.025, "living room": 0.015},
+        "table": {"dining room": 0.025, "office": 0.015, "living room": 0.015},
+        "desk": {"office": 0.05},
+    }
+    evidence: Dict[str, float] = {}
+    for token, boosts in {**strong, **weak}.items():
+        if token in key:
+            for room, boost in boosts.items():
+                evidence[room] = max(evidence.get(room, 0.0), boost)
+    return evidence
 
 
 def _heading_to_action_hint(
@@ -155,6 +340,7 @@ class DynamicTopoMap:
         self._nodes: Dict[str, SemanticNode] = {}
         self._node_counter = 0
         self._current_step = 0
+        self.failed_target_history: List[Dict[str, Any]] = []
 
 
         # Config
@@ -217,6 +403,9 @@ class DynamicTopoMap:
         self._last_visibility_debug: Dict[str, int] = {}
 
         self._object_memory = ObjectMemoryPool(self)
+        self.structure_layer = StructureLayer(self)
+        self.navigation_layer = NavigationLayer(self)
+        self.cross_layer = CrossLayerLinks(self)
     @property
     def num_nodes(self) -> int:
         return len(self._nodes)
@@ -255,6 +444,8 @@ class DynamicTopoMap:
             prefix = node_type.value[:3]
             node_id = self._generate_id(prefix)
 
+        attrs = dict(attributes or {})
+        self._standardize_layer_attributes(node_type, attrs)
         node = SemanticNode(
             node_id=node_id,
             node_type=node_type,
@@ -264,36 +455,489 @@ class DynamicTopoMap:
             label=label,
             step_id=self._current_step,
             visit_count=1 if node_type == NodeType.WAYPOINT_VISITED else 0,
-            attributes=attributes or {},
+            attributes=attrs,
         )
         self._nodes[node_id] = node
         self.graph.add_node(node_id, node_type=node_type.value)
         return node_id
 
+    def _standardize_layer_attributes(
+        self,
+        node_type: NodeType,
+        attrs: Dict[str, Any],
+    ) -> None:
+        if node_type == NodeType.WAYPOINT_VISITED:
+            attrs.setdefault("layer", "navigation")
+            attrs.setdefault("nav_role", "visited_waypoint")
+        elif node_type == NodeType.WAYPOINT_FRONTIER:
+            attrs.setdefault("layer", "navigation")
+            attrs.setdefault("nav_role", "frontier")
+            attrs.setdefault("blocked", False)
+            attrs.setdefault("consumed", False)
+            attrs.setdefault("failed_count", 0)
+            attrs.setdefault("unreachable_count", 0)
+        elif node_type == NodeType.WAYPOINT_CANDIDATE:
+            attrs.setdefault("layer", "navigation")
+            attrs.setdefault("nav_role", "candidate")
+        elif node_type == NodeType.WAYPOINT_APPROACH:
+            attrs.setdefault("layer", "navigation")
+            attrs.setdefault("nav_role", "approach")
+        elif node_type == NodeType.ROOM:
+            attrs.setdefault("layer", "structure")
+            attrs.setdefault("semantic_role", "room_region")
+            attrs.setdefault("summary_type", "room_region")
+        elif node_type == NodeType.OBJECT:
+            attrs.setdefault("layer", "structure")
+            attrs.setdefault("semantic_role", "object")
+        elif node_type == NodeType.LANDMARK:
+            attrs.setdefault("layer", "structure")
+            attrs.setdefault("semantic_role", attrs.get("structure_role") or "landmark")
+        elif node_type == NodeType.PORTAL:
+            attrs.setdefault("layer", "structure")
+            attrs.setdefault("semantic_role", "portal")
+            attrs.setdefault("connected_waypoints", [])
+            attrs.setdefault("connected_rooms", [])
+            attrs.setdefault("blocked", False)
+            attrs.setdefault("traversability", 1.0)
+        elif node_type == NodeType.SEMANTIC_RELATION:
+            attrs.setdefault("layer", "structure")
+            attrs.setdefault("semantic_role", "semantic_relation")
     def get_node(self, node_id: str) -> Optional[SemanticNode]:
         return self._nodes.get(node_id)
 
-    def get_object_anchor(self, node_id: str) -> Optional[dict]:
-        node = self._nodes.get(node_id)
-        if node is None:
+    def add_or_update_waypoint(
+        self,
+        position: np.ndarray,
+        *,
+        heading: Optional[float] = None,
+        embedding: Optional[np.ndarray] = None,
+        merge_radius: float = 0.6,
+        attributes: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Add or reuse a visited waypoint in the navigation layer."""
+        pos = np.asarray(position, dtype=np.float32)
+        nearest = self.find_nearest_node(pos, node_type=NodeType.WAYPOINT_VISITED)
+        attrs = dict(attributes or {})
+        attrs.setdefault("layer", "navigation")
+        attrs.setdefault("nav_role", "visited_waypoint")
+        if heading is not None:
+            attrs["heading"] = float(heading)
+        if nearest is not None and float(np.linalg.norm(nearest.position - pos)) < merge_radius:
+            nearest.visit_count += 1
+            nearest.confidence = min(1.0, float(nearest.confidence) + 0.05)
+            nearest.step_id = self._current_step
+            nearest.attributes.update(attrs)
+            if embedding is not None:
+                nearest.embedding = embedding
+            return nearest.node_id
+        return self.add_node(
+            NodeType.WAYPOINT_VISITED,
+            position=pos.copy(),
+            embedding=embedding,
+            confidence=0.9,
+            attributes=attrs,
+        )
+
+    def add_or_update_frontier(
+        self,
+        position: np.ndarray,
+        *,
+        created_from_waypoint: str,
+        embedding: Optional[np.ndarray] = None,
+        confidence: float = 0.45,
+        merge_radius: float = 1.2,
+        attributes: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Add or reuse an executable frontier node."""
+        pos = np.asarray(position, dtype=np.float32)
+        nearest = self.find_nearest_node(pos, node_type=NodeType.WAYPOINT_FRONTIER)
+        attrs = dict(attributes or {})
+        attrs.update({
+            "layer": "navigation",
+            "nav_role": "frontier",
+            "source": attrs.get("source", "frontier"),
+            "created_from": created_from_waypoint,
+            "blocked": bool(attrs.get("blocked", False)),
+            "consumed": bool(attrs.get("consumed", False)),
+            "failed_count": int(attrs.get("failed_count", 0) or 0),
+            "unreachable_count": int(attrs.get("unreachable_count", 0) or 0),
+        })
+        if nearest is not None and float(np.linalg.norm(nearest.position - pos)) < merge_radius:
+            nearest.confidence = max(float(nearest.confidence), float(confidence))
+            nearest.step_id = self._current_step
+            nearest.attributes.update(attrs)
+            frontier_id = nearest.node_id
+        else:
+            frontier_id = self.add_node(
+                NodeType.WAYPOINT_FRONTIER,
+                position=pos.copy(),
+                embedding=embedding,
+                confidence=confidence,
+                attributes=attrs,
+            )
+        self.add_edge(created_from_waypoint, frontier_id, EdgeType.NAVIGABLE)
+        return frontier_id
+
+    def add_or_update_room_region(
+        self,
+        *,
+        waypoint_id: str,
+        room_scores: Dict[str, float],
+        embedding: Optional[np.ndarray] = None,
+        radius: float = 5.0,
+        goal_room_prior: Optional[List[str]] = None,
+    ) -> Optional[str]:
+        """Aggregate waypoint room scores into a structure-layer RoomNode."""
+        wp = self._nodes.get(waypoint_id)
+        if wp is None or wp.node_type != NodeType.WAYPOINT_VISITED:
+            return None
+        normalized_scores = _normalizable_score_dict(room_scores)
+        if not normalized_scores:
             return None
 
-        attrs = node.attributes
-        if not attrs.get("is_semantic_anchor"):
+        # Goal prior contributes a soft boost instead of forcing a hard label.
+        for prior in goal_room_prior or []:
+            key = _label_key(prior)
+            if not key:
+                continue
+            normalized_scores[key] = float(normalized_scores.get(key, 0.0)) + 0.06
+
+        normalized_scores = _normalize_probs(normalized_scores)
+        if not normalized_scores:
             return None
 
-        position = attrs.get("anchor_position")
-        if position is None:
-            position = node.position.copy()
+        best_label, best_prob = max(normalized_scores.items(), key=lambda item: item[1])
 
-        return {
-            "position": position,
-            "waypoint_id": attrs.get("anchor_waypoint_id"),
-            "waypoint_position": attrs.get("anchor_waypoint_position"),
-            "room_id": attrs.get("anchor_room_id"),
-            "label": node.label,
-            "confidence": float(node.confidence),
-        }
+        wp.attributes["room_scores_snapshot"] = dict(normalized_scores)
+        wp.attributes["room_scores"] = dict(normalized_scores)
+        wp.attributes["view_room_label"] = best_label
+        wp.attributes["view_room_confidence"] = float(best_prob)
+        wp.attributes["room_label"] = "unknown"
+        wp.attributes["room_confidence"] = float(best_prob)
+
+        nearby = self.find_nodes_within_radius(wp.position, radius=radius, node_type=NodeType.ROOM)
+        room = None
+        best_match = -1.0
+        for candidate in nearby:
+            cand_probs = _normalizable_score_dict(candidate.attributes.get("room_probs", {}))
+            sim = _prob_similarity(normalized_scores, cand_probs)
+            if sim > best_match:
+                best_match = sim
+                room = candidate
+        if room is not None and best_match < 0.35:
+            room = None
+
+        if room is None:
+            room_id = self.add_node(
+                NodeType.ROOM,
+                position=wp.position.copy(),
+                embedding=embedding,
+                confidence=float(best_prob),
+                label="unknown",
+                attributes={
+                    "layer": "structure",
+                    "semantic_role": "room_region",
+                    "summary_type": "room_region",
+                    "room_probs": dict(normalized_scores),
+                    "room_label": "unknown",
+                    "room_state": "unknown",
+                    "member_waypoints": [],
+                    "evidence_views": [],
+                    "observed_objects": {},
+                    "observed_landmarks": [],
+                },
+            )
+            room = self._nodes[room_id]
+        else:
+            room_id = room.node_id
+            room.attributes.setdefault("layer", "structure")
+            room.attributes.setdefault("semantic_role", "room_region")
+            room.attributes.setdefault("summary_type", "room_region")
+
+        self.bind_room_member(room_id, waypoint_id)
+        self._update_room_region_from_members(room_id)
+        return room_id
+
+    def add_or_update_object_memory_node(
+        self,
+        *,
+        label: str,
+        confidence: float,
+        estimated_position: np.ndarray,
+        anchor_waypoint_id: str,
+        obj_attrs: Optional[Dict[str, Any]] = None,
+        node_id: Optional[str] = None,
+    ) -> str:
+        """Create or update a structure-layer object evidence node."""
+        attrs = dict(obj_attrs or {})
+        attrs.update({
+            "layer": "structure",
+            "semantic_role": "object",
+            "memory_state": attrs.get("memory_state", "confirmed"),
+            "estimated_object_position": np.asarray(estimated_position, dtype=np.float32).tolist(),
+            "best_anchor_waypoint_id": anchor_waypoint_id,
+            "anchor_waypoint_id": anchor_waypoint_id,
+        })
+        anchor = self._nodes.get(anchor_waypoint_id)
+        if anchor is not None:
+            attrs["anchor_waypoint_position"] = anchor.position.copy().tolist()
+        if node_id is None:
+            node_id = self.add_node(
+                NodeType.OBJECT,
+                position=np.asarray(estimated_position, dtype=np.float32).copy(),
+                confidence=float(confidence),
+                label=label,
+                attributes=attrs,
+            )
+        else:
+            node = self._nodes[node_id]
+            node.position = np.asarray(estimated_position, dtype=np.float32).copy()
+            node.confidence = max(float(node.confidence), float(confidence))
+            node.label = label or node.label
+            node.step_id = self._current_step
+            node.attributes.update(attrs)
+        self.bind_object_to_anchor(node_id, anchor_waypoint_id)
+        self.bind_object_observation(node_id, anchor_waypoint_id)
+        if anchor is not None:
+            room_id = anchor.attributes.get("room_region_id") or anchor.attributes.get("room_id")
+            if room_id:
+                self.bind_room_contains_object(str(room_id), node_id)
+        return node_id
+
+    def add_or_update_landmark_node(
+        self,
+        *,
+        label: str,
+        confidence: float,
+        estimated_position: np.ndarray,
+        observed_from_waypoint_id: str,
+        source: str = "vlm",
+        attributes: Optional[Dict[str, Any]] = None,
+        node_id: Optional[str] = None,
+    ) -> str:
+        attrs = dict(attributes or {})
+        attrs.update({
+            "layer": "structure",
+            "semantic_role": "landmark",
+            "source": source,
+            "best_anchor_waypoint_id": observed_from_waypoint_id,
+            "observed_from_waypoint_ids": [observed_from_waypoint_id],
+        })
+        pos = np.asarray(estimated_position, dtype=np.float32)
+        if node_id is None:
+            node_id = self.add_node(
+                NodeType.LANDMARK,
+                position=pos.copy(),
+                confidence=float(confidence),
+                label=label,
+                attributes=attrs,
+            )
+        else:
+            node = self._nodes[node_id]
+            node.position = pos.copy()
+            node.confidence = max(float(node.confidence), float(confidence))
+            node.label = label or node.label
+            node.step_id = self._current_step
+            node.attributes.update(attrs)
+        self.bind_landmark_observation(node_id, observed_from_waypoint_id)
+        return node_id
+
+    def add_or_update_portal_node(
+        self,
+        *,
+        label: str,
+        confidence: float,
+        estimated_position: np.ndarray,
+        observed_from_waypoint_id: str,
+        connected_waypoint_id: Optional[str] = None,
+        connected_room_ids: Optional[List[str]] = None,
+        attributes: Optional[Dict[str, Any]] = None,
+        node_id: Optional[str] = None,
+    ) -> str:
+        attrs = dict(attributes or {})
+        connected_waypoints = [observed_from_waypoint_id]
+        if connected_waypoint_id:
+            connected_waypoints.append(connected_waypoint_id)
+        attrs.update({
+            "layer": "structure",
+            "semantic_role": "portal",
+            "source": attrs.get("source", "vlm_or_frontier"),
+            "observed_from_waypoint_ids": [observed_from_waypoint_id],
+            "connected_waypoints": _dedupe_list(connected_waypoints),
+            "connected_rooms": _dedupe_list(connected_room_ids or []),
+            "blocked": bool(attrs.get("blocked", False)),
+            "traversability": float(attrs.get("traversability", 1.0)),
+        })
+        pos = np.asarray(estimated_position, dtype=np.float32)
+        if node_id is None:
+            node_id = self.add_node(
+                NodeType.PORTAL,
+                position=pos.copy(),
+                confidence=float(confidence),
+                label=label,
+                attributes=attrs,
+            )
+        else:
+            node = self._nodes[node_id]
+            node.position = pos.copy()
+            node.confidence = max(float(node.confidence), float(confidence))
+            node.label = label or node.label
+            node.step_id = self._current_step
+            node.attributes.update(attrs)
+        self.bind_portal_connection(node_id, observed_from_waypoint_id)
+        if connected_waypoint_id:
+            self.bind_portal_connection(node_id, connected_waypoint_id)
+        for room_id in connected_room_ids or []:
+            self.bind_portal_connection(node_id, room_id)
+        return node_id
+
+    def add_semantic_relation(
+        self,
+        *,
+        source_node_id: str,
+        target_node_id: str,
+        relation_type: str,
+        confidence: float = 0.5,
+        attributes: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        if source_node_id not in self._nodes or target_node_id not in self._nodes:
+            return None
+        source = self._nodes[source_node_id]
+        target = self._nodes[target_node_id]
+        position = ((source.position + target.position) * 0.5).astype(np.float32)
+        attrs = dict(attributes or {})
+        attrs.update({
+            "layer": "structure",
+            "semantic_role": "semantic_relation",
+            "source_node_id": source_node_id,
+            "target_node_id": target_node_id,
+            "relation_type": relation_type,
+        })
+        relation_id = self.add_node(
+            NodeType.SEMANTIC_RELATION,
+            position=position,
+            confidence=float(confidence),
+            label=relation_type,
+            attributes=attrs,
+        )
+        self.add_edge(source_node_id, relation_id, EdgeType.CONNECTS, relation=relation_type, confidence=confidence)
+        self.add_edge(relation_id, target_node_id, EdgeType.CONNECTS, relation=relation_type, confidence=confidence)
+        return relation_id
+
+    def add_candidate_node(
+        self,
+        *,
+        position: np.ndarray,
+        source: str,
+        target_structure_node_id: Optional[str] = None,
+        ttl: int = 8,
+        confidence: float = 0.35,
+        attributes: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        attrs = dict(attributes or {})
+        attrs.update({
+            "layer": "navigation",
+            "nav_role": "candidate",
+            "source": source,
+            "target_structure_node_id": target_structure_node_id,
+            "ttl": int(ttl),
+            "created_step": self._current_step,
+            "blocked": bool(attrs.get("blocked", False)),
+            "consumed": bool(attrs.get("consumed", False)),
+            "failed_count": int(attrs.get("failed_count", 0) or 0),
+            "unreachable_count": int(attrs.get("unreachable_count", 0) or 0),
+        })
+        return self.add_node(
+            NodeType.WAYPOINT_CANDIDATE,
+            position=np.asarray(position, dtype=np.float32).copy(),
+            confidence=float(confidence),
+            label=source,
+            attributes=attrs,
+        )
+
+    def _update_room_region_from_members(self, room_id: str) -> None:
+        room = self._nodes.get(room_id)
+        if room is None:
+            return
+        member_ids = [
+            str(wp_id) for wp_id in room.attributes.get("member_waypoints", [])
+            if str(wp_id) in self._nodes
+        ]
+        if not member_ids:
+            return
+        aggregate: Dict[str, float] = {}
+        positions: List[np.ndarray] = []
+        weights: List[float] = []
+        for wp_id in member_ids:
+            wp = self._nodes[wp_id]
+            scores = wp.attributes.get("room_scores_snapshot") or wp.attributes.get("room_scores") or {}
+            if not isinstance(scores, dict):
+                continue
+            for label, score in scores.items():
+                key = str(label)
+                aggregate[key] = aggregate.get(key, 0.0) + float(score)
+
+            # Neighbor consistency: include adjacent visited waypoints with a smaller weight.
+            for nbr in self.graph.neighbors(wp_id):
+                n = self._nodes.get(nbr)
+                if n is None or n.node_type != NodeType.WAYPOINT_VISITED:
+                    continue
+                edge = self.graph.edges[wp_id, nbr]
+                if not self._edge_has_type(edge, EdgeType.NAVIGABLE):
+                    continue
+                ns = n.attributes.get("room_scores_snapshot") or n.attributes.get("room_scores") or {}
+                if not isinstance(ns, dict):
+                    continue
+                for label, score in ns.items():
+                    key = str(label)
+                    aggregate[key] = aggregate.get(key, 0.0) + 0.25 * float(score)
+
+            weight = float(max(scores.values()) if scores else 0.1)
+            positions.append(wp.position)
+            weights.append(max(0.01, weight))
+        if aggregate:
+            denom = float(max(1, len(member_ids)))
+            room_probs = {label: float(score / denom) for label, score in aggregate.items()}
+
+            # Object evidence support (bed->bedroom, toilet->bathroom, etc.).
+            for obj_entry in (room.attributes.get("observed_objects", {}) or {}).values():
+                obj_label = str(obj_entry.get("label", "")).strip()
+                if not obj_label:
+                    continue
+                for room_label, boost in _room_evidence_from_object_label(obj_label).items():
+                    room_probs[room_label] = float(room_probs.get(room_label, 0.0)) + float(boost)
+
+            # Temporal consistency: EMA with previous distribution.
+            prev_probs = _normalizable_score_dict(room.attributes.get("room_probs", {}))
+            if prev_probs:
+                for key in set(room_probs.keys()) | set(prev_probs.keys()):
+                    room_probs[key] = 0.70 * float(room_probs.get(key, 0.0)) + 0.30 * float(prev_probs.get(key, 0.0))
+
+            room_probs = _normalize_probs(room_probs)
+            room.attributes["room_probs"] = room_probs
+            best_label, best_prob = max(room_probs.items(), key=lambda item: item[1])
+            evidence_count = len(room.attributes.get("evidence_views", []))
+
+            # Promotion rule: avoid hard labels too early.
+            if best_prob > 0.65 and evidence_count >= 3:
+                room.label = best_label
+                room.attributes["room_label"] = best_label
+                room.attributes["room_state"] = "confirmed"
+            elif best_prob > 0.45 and evidence_count >= 2:
+                room.label = "tentative"
+                room.attributes["room_label"] = "tentative"
+                room.attributes["room_state"] = "tentative"
+            else:
+                room.label = "unknown"
+                room.attributes["room_label"] = "unknown"
+                room.attributes["room_state"] = "unknown"
+            room.confidence = float(best_prob)
+        if positions:
+            weight_arr = np.asarray(weights, dtype=np.float32)
+            pos_arr = np.stack(positions, axis=0)
+            room.position = np.average(pos_arr, axis=0, weights=weight_arr).astype(np.float32)
+            room.position[1] = 0.0
+        room.step_id = self._current_step
 
     def remove_node(self, node_id: str):
         if node_id in self._nodes:
@@ -317,11 +961,23 @@ class DynamicTopoMap:
     ):
         """Add a typed edge between two nodes."""
         if node_a in self._nodes and node_b in self._nodes:
-            self.graph.add_edge(
-                node_a, node_b,
-                edge_type=edge_type.value,
-                weight=weight,
-            )
+            if self.graph.has_edge(node_a, node_b):
+                edge = self.graph.edges[node_a, node_b]
+                edge_types = list(edge.get("edge_types", []))
+                if not edge_types and edge.get("edge_type"):
+                    edge_types = [edge.get("edge_type")]
+                if edge_type.value not in edge_types:
+                    edge_types.append(edge_type.value)
+                edge["edge_types"] = edge_types
+                edge["edge_type"] = edge_types[0]
+                edge["weight"] = min(float(edge.get("weight", weight)), float(weight))
+            else:
+                self.graph.add_edge(
+                    node_a, node_b,
+                    edge_type=edge_type.value,
+                    edge_types=[edge_type.value],
+                    weight=weight,
+                )
             if edge_type == EdgeType.NAVIGABLE:
                 self._enrich_navigable_edge(node_a, node_b)
             else:
@@ -329,6 +985,279 @@ class DynamicTopoMap:
                     node_a, node_b, edge_type,
                     relation=relation, confidence=confidence,
                 )
+
+    def _set_edge_link_role(self, node_a: str, node_b: str, link_role: str) -> None:
+        if self.graph.has_edge(node_a, node_b):
+            edge = self.graph.edges[node_a, node_b]
+            edge["link_role"] = link_role
+            link_roles = list(edge.get("link_roles", []))
+            if link_role not in link_roles:
+                link_roles.append(link_role)
+            edge["link_roles"] = link_roles
+            edge["last_updated_step"] = self._current_step
+
+    @staticmethod
+    def _edge_has_type(data: Dict[str, Any], edge_type: EdgeType) -> bool:
+        return (
+            data.get("edge_type") == edge_type.value
+            or edge_type.value in set(data.get("edge_types", []))
+        )
+
+    def bind_object_to_anchor(self, object_id: str, waypoint_id: str) -> None:
+        if object_id not in self._nodes or waypoint_id not in self._nodes:
+            return
+        obj = self._nodes[object_id]
+        wp = self._nodes[waypoint_id]
+        obj.attributes["best_anchor_waypoint_id"] = waypoint_id
+        obj.attributes["anchor_waypoint_id"] = waypoint_id
+        obj.attributes["anchor_waypoint_position"] = wp.position.copy().tolist()
+        obj.attributes["layer"] = "structure"
+        obj.attributes["semantic_role"] = "object"
+        self.add_edge(object_id, waypoint_id, EdgeType.ANCHORED_TO)
+        self._set_edge_link_role(object_id, waypoint_id, "object_to_anchor_waypoint")
+
+    def bind_object_observation(self, object_id: str, waypoint_id: str) -> None:
+        if object_id not in self._nodes or waypoint_id not in self._nodes:
+            return
+        obj = self._nodes[object_id]
+        observed_ids = [
+            str(item) for item in obj.attributes.get("observed_from_waypoint_ids", [])
+        ]
+        if waypoint_id not in observed_ids:
+            observed_ids.append(waypoint_id)
+        obj.attributes["observed_from_waypoint_ids"] = observed_ids[-12:]
+        self.add_edge(object_id, waypoint_id, EdgeType.OBSERVED_FROM)
+        self._set_edge_link_role(object_id, waypoint_id, "object_observed_from")
+
+    def bind_room_member(self, room_id: str, waypoint_id: str) -> None:
+        if room_id not in self._nodes or waypoint_id not in self._nodes:
+            return
+        room = self._nodes[room_id]
+        wp = self._nodes[waypoint_id]
+        members = [str(item) for item in room.attributes.get("member_waypoints", [])]
+        if waypoint_id not in members:
+            members.append(waypoint_id)
+        room.attributes["member_waypoints"] = members
+        evidence = [str(item) for item in room.attributes.get("evidence_views", [])]
+        if waypoint_id not in evidence:
+            evidence.append(waypoint_id)
+        room.attributes["evidence_views"] = evidence[-32:]
+        wp.attributes["room_region_id"] = room_id
+        wp.attributes["room_id"] = room_id
+        wp.attributes["room_label"] = room.label
+        self.add_edge(room_id, waypoint_id, EdgeType.CONTAINS)
+        self._set_edge_link_role(waypoint_id, room_id, "room_member")
+
+    def bind_room_contains_object(self, room_id: str, object_id: str) -> None:
+        if room_id not in self._nodes or object_id not in self._nodes:
+            return
+        room = self._nodes[room_id]
+        obj = self._nodes[object_id]
+        observed = dict(room.attributes.get("observed_objects", {}))
+        observed[obj.node_id] = {
+            "label": obj.label,
+            "confidence": float(obj.confidence),
+            "last_seen_step": self._current_step,
+        }
+        room.attributes["observed_objects"] = observed
+        obj.attributes["room_id"] = room_id
+        obj.attributes["room_label"] = room.label
+        self._update_room_region_from_members(room_id)
+        self.add_edge(room_id, object_id, EdgeType.CONTAINS_OBJECT)
+        self._set_edge_link_role(room_id, object_id, "room_contains_object")
+
+    def bind_landmark_observation(self, landmark_id: str, waypoint_id: str) -> None:
+        if landmark_id not in self._nodes or waypoint_id not in self._nodes:
+            return
+        landmark = self._nodes[landmark_id]
+        observed = [str(item) for item in landmark.attributes.get("observed_from_waypoint_ids", [])]
+        if waypoint_id not in observed:
+            observed.append(waypoint_id)
+        landmark.attributes["observed_from_waypoint_ids"] = observed[-12:]
+        landmark.attributes["best_anchor_waypoint_id"] = observed[-1]
+        self.add_edge(landmark_id, waypoint_id, EdgeType.OBSERVED_FROM)
+        self._set_edge_link_role(landmark_id, waypoint_id, "landmark_observed_from")
+
+    def bind_portal_connection(self, portal_id: str, node_id: str) -> None:
+        if portal_id not in self._nodes or node_id not in self._nodes:
+            return
+        portal = self._nodes[portal_id]
+        node = self._nodes[node_id]
+        if node.node_type in self._NAV_NODE_TYPES:
+            connected = [str(item) for item in portal.attributes.get("connected_waypoints", [])]
+            role = "portal_connects_waypoint"
+        elif node.node_type == NodeType.ROOM:
+            connected = [str(item) for item in portal.attributes.get("connected_rooms", [])]
+            role = "portal_connects_room"
+        else:
+            connected = []
+            role = "portal_connects_structure"
+        if connected is not None and node_id not in connected:
+            connected.append(node_id)
+            if role == "portal_connects_waypoint":
+                portal.attributes["connected_waypoints"] = connected[-8:]
+            elif role == "portal_connects_room":
+                portal.attributes["connected_rooms"] = connected[-8:]
+        self.add_edge(portal_id, node_id, EdgeType.CONNECTS)
+        self._set_edge_link_role(portal_id, node_id, role)
+
+    def mark_navigation_target_failed(
+        self,
+        node_id: Optional[str],
+        *,
+        target_type: str,
+        unreachable: bool = False,
+        reason: str = "navigation_failed",
+    ) -> bool:
+        if node_id is None:
+            return False
+        node = self._nodes.get(node_id)
+        if node is None:
+            return False
+        failed_count = int(node.attributes.get("failed_count", 0) or 0) + 1
+        unreachable_count = int(node.attributes.get("unreachable_count", 0) or 0)
+        if unreachable:
+            unreachable_count += 1
+        node.attributes["failed_count"] = failed_count
+        node.attributes["unreachable_count"] = unreachable_count
+        node.attributes["last_failed_step"] = self._current_step
+        node.attributes["failure_reason"] = reason
+        node.attributes["last_failed_target_type"] = target_type
+        info = {
+            "node_id": node_id,
+            "target_type": target_type,
+            "failed_count": failed_count,
+            "unreachable_count": unreachable_count,
+            "unreachable": bool(unreachable),
+            "reason": reason,
+            "step": self._current_step,
+        }
+        self.failed_target_history.append(info)
+        self.failed_target_history = self.failed_target_history[-64:]
+        if node.node_type == NodeType.WAYPOINT_FRONTIER or target_type == "frontier":
+            node.attributes["blocked"] = bool(unreachable)
+            node.attributes["consumed"] = bool(unreachable)
+        else:
+            node.attributes["blocked"] = bool(unreachable)
+        node.confidence = max(0.05, float(node.confidence) * 0.5)
+        return True
+
+    def mark_structure_target_failed(
+        self,
+        structure_node_id: Optional[str],
+        *,
+        anchor_node_id: Optional[str] = None,
+        target_type: str,
+        unreachable: bool = False,
+        reason: str = "navigation_failed",
+    ) -> bool:
+        if structure_node_id is None:
+            return False
+        node = self._nodes.get(str(structure_node_id))
+        if node is None or node.node_type in self._NAV_NODE_TYPES:
+            return False
+        failed_count = int(node.attributes.get("failed_count", 0) or 0) + 1
+        unreachable_count = int(node.attributes.get("unreachable_count", 0) or 0)
+        if unreachable:
+            unreachable_count += 1
+        node.attributes["failed_count"] = failed_count
+        node.attributes["unreachable_count"] = unreachable_count
+        node.attributes["last_failed_step"] = self._current_step
+        node.attributes["failure_reason"] = reason
+        node.attributes["last_failed_target_type"] = target_type
+        if anchor_node_id:
+            bad = [str(item) for item in node.attributes.get("bad_anchor_waypoint_ids", []) or []]
+            anchor_id = str(anchor_node_id)
+            if anchor_id not in bad:
+                bad.append(anchor_id)
+            node.attributes["bad_anchor_waypoint_ids"] = bad[-12:]
+        if target_type == "portal_waypoint" and failed_count >= 3:
+            node.attributes["blocked"] = True
+            node.attributes["blocked_reason"] = reason
+        info = {
+            "node_id": str(structure_node_id),
+            "anchor_node_id": None if anchor_node_id is None else str(anchor_node_id),
+            "target_type": target_type,
+            "failed_count": failed_count,
+            "unreachable_count": unreachable_count,
+            "unreachable": bool(unreachable),
+            "reason": reason,
+            "step": self._current_step,
+            "layer": "structure",
+        }
+        self.failed_target_history.append(info)
+        self.failed_target_history = self.failed_target_history[-64:]
+        node.confidence = max(0.05, float(node.confidence) * 0.75)
+        return True
+
+    def mark_edge_blocked(
+        self,
+        node_a: str,
+        node_b: str,
+        *,
+        reason: str = "blocked",
+    ) -> bool:
+        if node_a not in self._nodes or node_b not in self._nodes:
+            return False
+        if self.graph.has_edge(node_a, node_b):
+            edge = self.graph.edges[node_a, node_b]
+            edge["blocked"] = True
+            edge["blocked_reason"] = reason
+            edge["blocked_step"] = self._current_step
+            edge["blocked_count"] = int(edge.get("blocked_count", 0) or 0) + 1
+            edge["traversability"] = 0.0
+            edge_types = list(edge.get("edge_types", []))
+            if not edge_types and edge.get("edge_type"):
+                edge_types = [edge.get("edge_type")]
+            if EdgeType.BLOCKED.value not in edge_types:
+                edge_types.append(EdgeType.BLOCKED.value)
+            edge["edge_types"] = edge_types
+        else:
+            self.add_edge(node_a, node_b, EdgeType.BLOCKED, relation=reason, confidence=1.0)
+        if self.graph.has_edge(node_a, node_b):
+            self.graph.edges[node_a, node_b]["link_role"] = "blocked_edge"
+        return True
+
+    def navigation_target_for_structure_node(
+        self,
+        structure_node_id: str,
+    ) -> Optional[SemanticNode]:
+        node = self._nodes.get(structure_node_id)
+        if node is None:
+            return None
+        attrs = node.attributes
+        bad_anchor_ids = {
+            str(item)
+            for item in attrs.get("bad_anchor_waypoint_ids", []) or []
+            if str(item).strip()
+        }
+        candidates = [
+            attrs.get("approach_point_id"),
+            attrs.get("best_anchor_waypoint_id"),
+            attrs.get("anchor_waypoint_id"),
+            attrs.get("observed_from_waypoint_id"),
+        ]
+        observed = attrs.get("observed_from_waypoint_ids")
+        if isinstance(observed, list):
+            candidates.extend(str(item) for item in reversed(observed))
+        members = attrs.get("member_waypoints")
+        if isinstance(members, list):
+            candidates.extend(str(item) for item in members)
+        for candidate_id in candidates:
+            if not candidate_id:
+                continue
+            if str(candidate_id) in bad_anchor_ids:
+                continue
+            candidate = self._nodes.get(str(candidate_id))
+            if (
+                candidate is not None
+                and candidate.node_type in self._NAV_NODE_TYPES
+                and not bool(candidate.attributes.get("blocked", False))
+            ):
+                return candidate
+        if node.node_type in self._NAV_NODE_TYPES:
+            return node
+        return None
     #找与 node 直接相连的 node
     def _enrich_navigable_edge(self, node_a: str, node_b: str) -> None:
         """Add structured attributes to a NAVIGABLE edge (bidirectional)."""
@@ -386,8 +1315,8 @@ class DynamicTopoMap:
             return "passage"
         attrs = portal_node.attributes
         label = (portal_label or "").lower()
-        if attrs.get("synthetic_portal"):
-            return "synthetic_portal"
+        if attrs.get("semantic_role") == "portal" or portal_node.node_type == NodeType.PORTAL:
+            return "portal"
         if "door" in label or "doorway" in label:
             return "door"
         if "arch" in label:
@@ -544,8 +1473,8 @@ class DynamicTopoMap:
         so decay depends on how long ago the node was last observed, not
         on the total run length.
 
-        Important nodes (object anchors, cross-goal preserved, etc.)
-        are exempted — same criteria as `prune_low_confidence`.
+        Persistent structure nodes and confirmed objects are exempted using
+        the same criteria as `prune_low_confidence`.
         """
         from conftopo.core.confidence import compute_semantic_confidence, ConfidenceFactors
         for node in self._nodes.values():
@@ -554,11 +1483,9 @@ class DynamicTopoMap:
             # Exempt important nodes (same criteria as prune_low_confidence)
             if self._is_persistent_structure_node(node):
                 continue
-            if node.attributes.get("is_semantic_anchor"):
-                continue
             if node.attributes.get("cross_goal_preserved"):
                 continue
-            if node.attributes.get("semantic_role") == "object_anchor":
+            if node.attributes.get("semantic_role") == "object":
                 continue
             # P11: Protect confirmed objects from full decay
             if node.node_type == NodeType.OBJECT:
@@ -633,30 +1560,11 @@ class DynamicTopoMap:
         if viewpoint_id is not None and self._should_add_observation_edge(
             obj_id, viewpoint_id, room_context,
         ):
-            self.add_edge(viewpoint_id, obj_id, EdgeType.OBSERVED_AT)
+            self.bind_object_observation(obj_id, viewpoint_id)
         
-        # P3: Sync ApproachPoint node
+        # Sync executable approach/candidate point in the navigation layer.
         self._sync_approach_point(obj_id, viewpoint_id, position)
-        
-        # P4: Sync ObjectSummaryNode for this object's room
-        obj_node = self._nodes.get(obj_id)
-        if obj_node is not None:
-            room_context_raw = obj_node.attributes.get("room_context")
-            if room_context_raw and room_context_raw != "unknown":
-                for room in self.find_nodes_within_radius(position, self.summary_radius, NodeType.ROOM):
-                    if room.label == room_context_raw:
-                        self._sync_object_summary_from_room(room)
-                        break
-        
-        # P4: Sync GoalRegion for goal-relevant anchors
-        sem_role = obj_node.attributes.get("semantic_role") if obj_node else None
-        if sem_role == "object_anchor":
-            self._sync_goal_region(
-                goal_key=obj_node.label,
-                target_label=obj_node.label,
-                anchor_position=position,
-            )
-        
+
         return obj_id, merged
 
     def _best_object_match(
@@ -885,30 +1793,6 @@ class DynamicTopoMap:
             self.add_edge(viewpoint_id, ap_id, EdgeType.NAVIGABLE)
         return ap_id
 
-    def promote_object_anchor_if_better(
-        self,
-        node: SemanticNode,
-        position: np.ndarray,
-        viewpoint_id: Optional[str],
-        bbox: Optional[List[float]],
-        range_bin: Optional[str],
-        confidence: float,
-    ) -> bool:
-        """Move object anchor to a closer/better viewpoint when VLM re-sees target."""
-        if node.attributes.get("position_source") != "anchor_waypoint":
-            return False
-        if not self._should_promote_anchor(node.attributes, bbox, range_bin, confidence):
-            return False
-        node.position = position.copy()
-        if viewpoint_id:
-            node.attributes["anchor_waypoint_id"] = viewpoint_id
-            node.attributes["observed_from"] = viewpoint_id
-        self._record_best_anchor_score(node.attributes, bbox, range_bin, confidence)
-        anchor_pos = self._object_anchor_position(node)
-        best_pos = anchor_pos if anchor_pos is not None else self._compute_best_approach(node.node_id)
-        node.attributes["best_approach_position"] = best_pos.tolist()
-        return True
-
     def _merge_object_observation(
         self,
         node: SemanticNode,
@@ -966,13 +1850,9 @@ class DynamicTopoMap:
         low_scores = [s for s in attrs.get("detection_scores", []) if float(s) < 0.35]
         attrs["redundancy_penalty"] = max(0.0, (len(low_scores) - 1) / 5.0)
         attrs["conflict_penalty"] = self._nearby_conflict_penalty(node, position)
-        range_bin = clean_spatial.get("range_bin") or attrs.get("range_bin")
-        if attrs.get("position_source") == "anchor_waypoint":
-            self.promote_object_anchor_if_better(
-                node, position, viewpoint_id, bbox, range_bin, confidence,
-            )
-        else:
-            node.position = (node.position * max(1, node.visit_count) + position) / (max(1, node.visit_count) + 1)
+        node.position = (
+            node.position * max(1, node.visit_count) + position
+        ) / (max(1, node.visit_count) + 1)
         node.visit_count += 1
         if embedding is not None:
             if node.embedding is None:
@@ -1063,15 +1943,6 @@ class DynamicTopoMap:
                 best_dist = d
                 best_pos = vp.position.copy()
         return best_pos
-
-    def _object_anchor_position(self, node: SemanticNode) -> Optional[np.ndarray]:
-        if node.attributes.get("position_source") != "anchor_waypoint":
-            return None
-        anchor_id = node.attributes.get("anchor_waypoint_id") or node.attributes.get("observed_from")
-        anchor = self._nodes.get(anchor_id)
-        if anchor is None:
-            return None
-        return anchor.position.copy()
 
     def _nearby_conflict_penalty(self, node: SemanticNode, position: np.ndarray) -> float:
         conflicts = 0
@@ -1181,7 +2052,7 @@ class DynamicTopoMap:
             attrs["fused_into_landmark_id"] = matched.node_id
             attrs["folded"] = True
             attrs["folded_reason"] = "fused_into_landmark"
-            self.add_edge(node.node_id, matched.node_id, EdgeType.BELONGS_TO)
+            self.add_edge(node.node_id, matched.node_id, EdgeType.CONNECTS)
             return matched.node_id
 
         has_bbox = bool(attrs.get("bbox_observations"))
@@ -1319,11 +2190,9 @@ class DynamicTopoMap:
                 continue
             if self._is_persistent_structure_node(node):
                 continue
-            if node.attributes.get("is_semantic_anchor"):
-                continue
             if node.attributes.get("cross_goal_preserved"):
                 continue
-            if node.attributes.get("semantic_role") == "object_anchor":
+            if node.attributes.get("semantic_role") == "object":
                 continue
             if float(node.attributes.get("target_relevance", 0.0)) > 0:
                 continue
@@ -1443,10 +2312,7 @@ class DynamicTopoMap:
     def _should_keep_object_detail(self, node: SemanticNode) -> bool:
         """Whether a long-term object should stay as detailed active memory."""
         attrs = node.attributes
-        role = attrs.get("semantic_role")
-        if role == "object_anchor":
-            return True
-        if attrs.get("is_semantic_anchor") and float(attrs.get("target_relevance", 0.0)) > 0:
+        if attrs.get("semantic_role") == "object":
             return True
         if float(node.confidence) >= 0.55:
             return True
@@ -1510,11 +2376,12 @@ class DynamicTopoMap:
             if neighbor == keep_id:
                 continue
             edge_data = dict(self.graph.edges[waypoint_id, neighbor])
-            edge_type_value = edge_data.get("edge_type", EdgeType.OBSERVED_AT.value)
+            edge_type_value = edge_data.get("edge_type", EdgeType.OBSERVED_FROM.value)
             weight = float(edge_data.get("weight", 1.0))
             if self.graph.has_edge(keep_id, neighbor):
                 existing = self.graph.edges[keep_id, neighbor]
-                if existing.get("edge_type") == edge_type_value:
+                existing_types = set(existing.get("edge_types", [existing.get("edge_type")]))
+                if edge_type_value in existing_types:
                     continue
             edge_type = EdgeType(edge_type_value)
             self.add_edge(keep_id, neighbor, edge_type, weight=weight)
@@ -1609,72 +2476,6 @@ class DynamicTopoMap:
         self._mark_waypoint_roles(entrance_ids)
         return removed
 
-
-    def _sync_object_summary_from_room(self, room_node: SemanticNode) -> Optional[str]:
-        summary = room_node.attributes.get("semantic_summary", {})
-        contains = summary.get("contains_labels", {})
-        if not contains:
-            return None
-
-        existing_id = room_node.attributes.get("object_summary_node_id")
-        if existing_id is not None and existing_id in self._nodes:
-            existing = self._nodes[existing_id]
-            existing.attributes["contains_labels"] = dict(contains)
-            existing.step_id = self._current_step
-            return existing_id
-
-        obj_summary_id = self.add_node(
-            NodeType.OBJECT_SUMMARY,
-            position=room_node.position.copy(),
-            confidence=room_node.confidence,
-            label=f"summary_{room_node.label}",
-            attributes={
-                "room_node_id": room_node.node_id,
-                "contains_labels": dict(contains),
-                "created_step": self._current_step,
-            },
-        )
-        room_node.attributes["object_summary_node_id"] = obj_summary_id
-        self.add_edge(obj_summary_id, room_node.node_id, EdgeType.BELONGS_TO)
-        return obj_summary_id
-
-    def _sync_goal_region(
-        self,
-        goal_key: str,
-        target_label: str,
-        anchor_position: Optional[np.ndarray],
-    ) -> Optional[str]:
-        if anchor_position is None:
-            return None
-
-        nearest_room = self.find_nearest_node(anchor_position, NodeType.ROOM)
-        if nearest_room is None:
-            return None
-
-        region_label = nearest_room.label
-
-        for node in self.get_nodes_by_type(NodeType.GOAL_REGION):
-            if node.attributes.get("goal_key") == goal_key:
-                node.step_id = self._current_step
-                node.confidence = max(node.confidence, 0.6)
-                return node.node_id
-
-        goal_region_id = self.add_node(
-            NodeType.GOAL_REGION,
-            position=nearest_room.position.copy(),
-            confidence=0.6,
-            label=f"goal_region_{region_label}_{target_label}",
-            attributes={
-                "goal_key": goal_key,
-                "target_label": target_label,
-                "room_label": region_label,
-                "room_node_id": nearest_room.node_id,
-                "created_step": self._current_step,
-            },
-        )
-        self.add_edge(goal_region_id, nearest_room.node_id, EdgeType.BELONGS_TO)
-        return goal_region_id
-
     def _room_region_summaries(self) -> List[SemanticNode]:
         return [
             room for room in self.get_nodes_by_type(NodeType.ROOM)
@@ -1731,7 +2532,7 @@ class DynamicTopoMap:
     #   * navigation layer  -> waypoints (visited / frontier / candidate)
     #                          + NAVIGABLE edges
     #   * structure layer   -> rooms + portals + structural landmarks
-    #                          + ADJACENT_TO / BELONGS_TO edges between them
+    #                          + semantic/cross-layer relation edges
     #
     # Consumers (planner, viz, debug) should prefer these views over
     # touching ``self.graph`` directly so that future storage refactors do
@@ -1745,10 +2546,12 @@ class DynamicTopoMap:
     )
 
     def _is_structural_landmark_node(self, node: SemanticNode) -> bool:
+        if node.node_type == NodeType.PORTAL:
+            return True
         if node.node_type != NodeType.LANDMARK:
             return False
         attrs = node.attributes
-        if attrs.get("synthetic_portal") or attrs.get("structure_role") == "portal":
+        if attrs.get("semantic_role") == "portal" or attrs.get("structure_role") == "portal":
             return True
         if attrs.get("landmark_source") == "environment" or attrs.get("source") == "environment":
             return False
@@ -1762,66 +2565,90 @@ class DynamicTopoMap:
         ]
 
     def navigation_layer_edges(self) -> List[Tuple[str, str, Dict[str, Any]]]:
-        """Return NAVIGABLE edges between waypoint nodes."""
+        """Return executable NAVIGABLE/BLOCKED edges between navigation nodes."""
         nav_ids = {node.node_id for node in self.navigation_layer_nodes()}
         edges: List[Tuple[str, str, Dict[str, Any]]] = []
         for node_a, node_b, data in self.graph.edges(data=True):
-            if data.get("edge_type") != EdgeType.NAVIGABLE.value:
+            if not (
+                self._edge_has_type(data, EdgeType.NAVIGABLE)
+                or self._edge_has_type(data, EdgeType.BLOCKED)
+            ):
                 continue
             if node_a in nav_ids and node_b in nav_ids:
                 edges.append((node_a, node_b, dict(data)))
         return edges
 
     def structure_layer_nodes(self) -> List[SemanticNode]:
-        """Rooms + portals + structural landmarks + summaries + goal regions."""
+        """Return semantic world-model nodes, never executable waypoints."""
         out: List[SemanticNode] = []
         for node in self._nodes.values():
-            if node.node_type == NodeType.ROOM and node.attributes.get("summary_type") == "room_region":
-                out.append(node)
-            elif self._is_structural_landmark_node(node):
-                out.append(node)
-            elif node.node_type == NodeType.OBJECT_SUMMARY:
-                out.append(node)
-            elif node.node_type == NodeType.GOAL_REGION:
+            if node.node_type in {
+                NodeType.ROOM,
+                NodeType.OBJECT,
+                NodeType.LANDMARK,
+                NodeType.PORTAL,
+                NodeType.SEMANTIC_RELATION,
+            } and node.attributes.get("layer") == "structure":
                 out.append(node)
         return out
 
     def structure_layer_edges(self) -> List[Tuple[str, str, Dict[str, Any]]]:
-        """ADJACENT_TO / BELONGS_TO edges within the structure layer."""
+        """Return semantic relations within the structure layer."""
         struct_ids = {node.node_id for node in self.structure_layer_nodes()}
-        wanted = (EdgeType.ADJACENT_TO.value, EdgeType.BELONGS_TO.value)
+        wanted = {
+            EdgeType.ADJACENT_TO.value,
+            EdgeType.IN_ROOM.value,
+            EdgeType.NEAR.value,
+            EdgeType.CONTAINS_OBJECT.value,
+            EdgeType.CONNECTS.value,
+        }
         edges: List[Tuple[str, str, Dict[str, Any]]] = []
         for node_a, node_b, data in self.graph.edges(data=True):
-            if data.get("edge_type") not in wanted:
+            edge_types = set(data.get("edge_types", [data.get("edge_type")]))
+            if not edge_types.intersection(wanted):
                 continue
             if node_a in struct_ids and node_b in struct_ids:
                 edges.append((node_a, node_b, dict(data)))
-
-        # P2: Include IN_ROOM edges between structure layer nodes and OBJECTs
-        for node_a, node_b, data in self.graph.edges(data=True):
-            if data.get("edge_type") != EdgeType.IN_ROOM.value:
-                continue
-            if node_a in struct_ids or node_b in struct_ids:
-                edges.append((node_a, node_b, dict(data)))
-
         return edges
 
     def cross_layer_waypoint_room_edges(self) -> List[Tuple[str, str]]:
-        """Cross-layer BELONGS_TO edges binding waypoints to rooms."""
+        """Cross-layer CONTAINS edges binding rooms to waypoints."""
         rooms = {
             node.node_id for node in self._nodes.values()
             if node.node_type == NodeType.ROOM
-            and node.attributes.get("summary_type") == "room_region"
+            and node.attributes.get("layer") == "structure"
         }
         waypoints = {node.node_id for node in self.navigation_layer_nodes()}
         out: List[Tuple[str, str]] = []
         for node_a, node_b, data in self.graph.edges(data=True):
-            if data.get("edge_type") != EdgeType.BELONGS_TO.value:
+            if not self._edge_has_type(data, EdgeType.CONTAINS):
                 continue
             if node_a in waypoints and node_b in rooms:
                 out.append((node_a, node_b))
             elif node_b in waypoints and node_a in rooms:
                 out.append((node_b, node_a))
+        return out
+
+    def cross_layer_edges(self) -> List[Tuple[str, str, Dict[str, Any]]]:
+        """Return semantic-to-navigation bindings across the two layers."""
+        nav_ids = {node.node_id for node in self.navigation_layer_nodes()}
+        struct_ids = {node.node_id for node in self.structure_layer_nodes()}
+        wanted = {
+            EdgeType.ANCHORED_TO.value,
+            EdgeType.OBSERVED_FROM.value,
+            EdgeType.CONTAINS.value,
+            EdgeType.CONNECTS.value,
+            EdgeType.SERVES_OBJECT.value,
+        }
+        out: List[Tuple[str, str, Dict[str, Any]]] = []
+        for node_a, node_b, data in self.graph.edges(data=True):
+            edge_types = set(data.get("edge_types", [data.get("edge_type")]))
+            if not edge_types.intersection(wanted):
+                continue
+            a_struct_b_nav = node_a in struct_ids and node_b in nav_ids
+            b_struct_a_nav = node_b in struct_ids and node_a in nav_ids
+            if a_struct_b_nav or b_struct_a_nav:
+                out.append((node_a, node_b, dict(data)))
         return out
 
     def get_navigation_view(self) -> Dict[str, Any]:
@@ -1841,17 +2668,24 @@ class DynamicTopoMap:
                 for n in nodes
             ],
             "edges": [
-                {"source": a, "target": b, "type": data.get("edge_type", ""),
-                 "weight": float(data.get("weight", 1.0))}
+                {
+                    "source": a,
+                    "target": b,
+                    "type": data.get("edge_type", ""),
+                    "edge_types": list(data.get("edge_types", [])),
+                    "weight": float(data.get("weight", 1.0)),
+                    "blocked": bool(data.get("blocked", False)),
+                    "traversability": float(data.get("traversability", 1.0)),
+                }
                 for a, b, data in edges
             ],
+            "failed_targets": list(self.failed_target_history),
         }
 
     def get_structure_view(self) -> Dict[str, Any]:
         """Snapshot of the structural skeleton layer."""
         nodes = self.structure_layer_nodes()
         edges = self.structure_layer_edges()
-        cross = self.cross_layer_waypoint_room_edges()
         return {
             "layer": "structure",
             "nodes": [
@@ -1865,12 +2699,37 @@ class DynamicTopoMap:
                 for n in nodes
             ],
             "edges": [
-                {"source": a, "target": b, "type": data.get("edge_type", ""),
-                 "weight": float(data.get("weight", 1.0))}
+                {
+                    "source": a,
+                    "target": b,
+                    "type": data.get("edge_type", ""),
+                    "edge_types": list(data.get("edge_types", [])),
+                    "weight": float(data.get("weight", 1.0)),
+                }
+                for a, b, data in edges
+            ],
+        }
+
+    def get_cross_layer_view(self) -> Dict[str, Any]:
+        """Snapshot of bindings from structure evidence to navigation nodes."""
+        edges = self.cross_layer_edges()
+        return {
+            "layer": "cross",
+            "edges": [
+                {
+                    "source": a,
+                    "target": b,
+                    "type": data.get("edge_type", ""),
+                    "edge_types": list(data.get("edge_types", [])),
+                    "link_role": data.get("link_role", ""),
+                    "link_roles": list(data.get("link_roles", [])),
+                    "weight": float(data.get("weight", 1.0)),
+                }
                 for a, b, data in edges
             ],
             "waypoint_room_bindings": [
-                {"waypoint_id": wp, "room_id": room} for wp, room in cross
+                {"waypoint_id": wp, "room_id": room}
+                for wp, room in self.cross_layer_waypoint_room_edges()
             ],
         }
 
@@ -2111,7 +2970,7 @@ class DynamicTopoMap:
         if not self.graph.has_edge(node_a, node_b):
             return False
         data = self.graph.edges[node_a, node_b]
-        return data.get("edge_type") == edge_type.value
+        return self._edge_has_type(data, edge_type)
 
     def _add_or_strengthen_edge(
         self,
@@ -2133,16 +2992,17 @@ class DynamicTopoMap:
         """Landmarks eligible for the long-term spatial structure skeleton.
 
         Only **structural** landmarks (door / corridor / stair / window /
-        synthetic portals) participate in room-portal-room skeleton building.
+        explicit portals) participate in room-portal-room skeleton building.
         Semantic landmarks (sofa / tv / vase) stay in the local semantic
         layer and never become portals or hubs.
         """
         result = []
+        result.extend(self.get_nodes_by_type(NodeType.PORTAL))
         for node in self.get_nodes_by_type(NodeType.LANDMARK):
             attrs = node.attributes
             if attrs.get("landmark_source") == "environment" or attrs.get("source") == "environment":
                 continue
-            if attrs.get("synthetic_portal") or attrs.get("structure_role") == "portal":
+            if attrs.get("semantic_role") == "portal" or attrs.get("structure_role") == "portal":
                 result.append(node)
                 continue
             role = classify_landmark_role(node.label, attrs)
@@ -2180,7 +3040,7 @@ class DynamicTopoMap:
     ) -> List[SemanticNode]:
         members = [
             landmark for landmark in nav_landmarks
-            if self._edge_exists(landmark.node_id, room.node_id, EdgeType.BELONGS_TO)
+            if self._edge_exists(landmark.node_id, room.node_id, EdgeType.CONNECTS)
         ]
         if members:
             return members
@@ -2199,8 +3059,8 @@ class DynamicTopoMap:
             nb = self._nodes.get(node_b)
             if na is None or nb is None:
                 continue
-            if na.node_type in (NodeType.ROOM, NodeType.LANDMARK) and nb.node_type in (
-                NodeType.ROOM, NodeType.LANDMARK,
+            if na.node_type in (NodeType.ROOM, NodeType.LANDMARK, NodeType.PORTAL) and nb.node_type in (
+                NodeType.ROOM, NodeType.LANDMARK, NodeType.PORTAL,
             ):
                 to_remove.append((node_a, node_b))
         for node_a, node_b in to_remove:
@@ -2242,10 +3102,10 @@ class DynamicTopoMap:
             transitions.append((room_a, room_b, wp_a, wp_b, seg_dist))
         return transitions
 
-    def _prune_synthetic_portals(self) -> None:
+    def _prune_auto_portals(self) -> None:
         stale = [
-            node.node_id for node in self.get_nodes_by_type(NodeType.LANDMARK)
-            if node.attributes.get("synthetic_portal")
+            node.node_id for node in self.get_nodes_by_type(NodeType.PORTAL)
+            if node.attributes.get("portal_source") == "auto_room_transition"
         ]
         for node_id in stale:
             self.remove_node(node_id)
@@ -2262,7 +3122,7 @@ class DynamicTopoMap:
 
         nav_landmarks = self._nav_landmarks()
         self._clear_structure_anchors(nav_landmarks)
-        self._prune_synthetic_portals()
+        self._prune_auto_portals()
         self._prune_structure_adjacent_edges()
 
         portal_max = max(self.merge_radius * 5.0, self.summary_radius * 1.2)
@@ -2279,16 +3139,17 @@ class DynamicTopoMap:
             portal_id = self._pair_portal_node_id(room_a.node_id, room_b.node_id)
             if not self.has_node(portal_id):
                 self.add_node(
-                    NodeType.LANDMARK,
+                    NodeType.PORTAL,
                     position=midpoint.copy(),
                     confidence=float(ref_portal.confidence) if ref_portal else 0.55,
                     label=str(ref_portal.label) if ref_portal else "passage",
                     node_id=portal_id,
                     attributes={
+                        "layer": "structure",
+                        "semantic_role": "portal",
                         "structure_anchor": True,
                         "structure_role": "portal",
-                        "synthetic_portal": True,
-                        "landmark_role": "structural",
+                        "portal_source": "auto_room_transition",
                         "structure_room_pairs": [list(pair_key)],
                         "portal_ref": ref_portal.node_id if ref_portal else None,
                         "structure_pair_labels": [
@@ -2319,29 +3180,33 @@ class DynamicTopoMap:
             )
 
         for landmark in nav_landmarks:
-            if landmark.attributes.get("structure_role") == "portal":
+            if (
+                landmark.node_type == NodeType.PORTAL
+                or landmark.attributes.get("semantic_role") == "portal"
+                or landmark.attributes.get("structure_role") == "portal"
+            ):
                 continue
             room = self._room_for_position(landmark.position, rooms)
             if room is None:
                 continue
             if self._edge_exists(landmark.node_id, room.node_id, EdgeType.ADJACENT_TO):
                 continue
-            if not self._edge_exists(landmark.node_id, room.node_id, EdgeType.BELONGS_TO):
-                self.add_edge(landmark.node_id, room.node_id, EdgeType.BELONGS_TO)
+            if not self._edge_exists(landmark.node_id, room.node_id, EdgeType.CONNECTS):
+                self.add_edge(landmark.node_id, room.node_id, EdgeType.CONNECTS)
 
         for room in rooms:
             members = self._landmarks_for_room(room, nav_landmarks)
             if not members:
                 continue
             hub = max(members, key=lambda landmark: float(landmark.confidence))
-            if hub.attributes.get("structure_role") != "portal":
+            if hub.node_type != NodeType.PORTAL and hub.attributes.get("semantic_role") != "portal":
                 hub.attributes["structure_role"] = "hub"
                 hub.attributes["structure_anchor"] = False
             room.attributes["hub_landmark_id"] = hub.node_id
             if self._edge_exists(hub.node_id, room.node_id, EdgeType.ADJACENT_TO):
                 continue
-            if not self._edge_exists(hub.node_id, room.node_id, EdgeType.BELONGS_TO):
-                self.add_edge(hub.node_id, room.node_id, EdgeType.BELONGS_TO)
+            if not self._edge_exists(hub.node_id, room.node_id, EdgeType.CONNECTS):
+                self.add_edge(hub.node_id, room.node_id, EdgeType.CONNECTS)
 
         self._dedupe_room_summaries(rooms)
 
@@ -2395,7 +3260,6 @@ class DynamicTopoMap:
         attrs["is_active_detail"] = False
         attrs["detail_active"] = False
         attrs["allow_fold"] = True
-        attrs["is_semantic_anchor"] = True
 
         attrs["anchor_position"] = node.position.tolist()
         nearest_visited_wp = self.find_nearest_node(
@@ -2456,7 +3320,8 @@ class DynamicTopoMap:
             return None
         summary = self._find_or_create_room_summary(node)
         self._update_room_summary(summary, node, reason)
-        self.add_edge(node.node_id, summary.node_id, EdgeType.BELONGS_TO)
+        edge_type = EdgeType.CONTAINS_OBJECT if node.node_type == NodeType.OBJECT else EdgeType.CONNECTS
+        self.add_edge(summary.node_id, node.node_id, edge_type)
         return summary.node_id
 
     def _find_or_create_room_summary(self, node: SemanticNode) -> SemanticNode:
@@ -2636,8 +3501,7 @@ class DynamicTopoMap:
 
         Returns the room summary id if a binding was created/updated, else
         ``None``. The binding lives both as ``waypoint.attributes["room_id"]``
-        (cheap reads) and as a ``BELONGS_TO`` edge (so debug / viz code that
-        traverses edges sees a consistent picture).
+        (cheap reads) and as a ``CONTAINS`` cross-layer edge.
         """
         wp = self._nodes.get(waypoint_id)
         if wp is None or wp.node_type != NodeType.WAYPOINT_VISITED:
@@ -2682,9 +3546,9 @@ class DynamicTopoMap:
 
         if prev_room_id and prev_room_id != room.node_id and self.graph.has_edge(waypoint_id, prev_room_id):
             edge = self.graph.edges[waypoint_id, prev_room_id]
-            if edge.get("edge_type") == EdgeType.BELONGS_TO.value:
+            if self._edge_has_type(edge, EdgeType.CONTAINS):
                 self.graph.remove_edge(waypoint_id, prev_room_id)
-        self.add_edge(waypoint_id, room.node_id, EdgeType.BELONGS_TO)
+        self.bind_room_member(room.node_id, waypoint_id)
         return room.node_id
 
     def mark_recovered_from_summary(
@@ -2702,7 +3566,7 @@ class DynamicTopoMap:
         node.attributes["recovered_from_summary"] = True
         node.attributes["summary_node_id"] = summary.node_id
         node.attributes["recovered_step"] = self._current_step
-        self.add_edge(object_id, summary.node_id, EdgeType.BELONGS_TO)
+        self.add_edge(summary.node_id, object_id, EdgeType.CONTAINS_OBJECT)
         return summary.node_id
 
     def _compress_object_history(self, node: SemanticNode, reason: str) -> None:
@@ -2776,7 +3640,7 @@ class DynamicTopoMap:
         """Find shortest path between two nodes using specified edge type."""
         sub_graph = nx.Graph()
         for u, v, data in self.graph.edges(data=True):
-            if data.get("edge_type") == edge_type.value:
+            if self._edge_has_type(data, edge_type) and not bool(data.get("blocked", False)):
                 sub_graph.add_edge(u, v, weight=data.get("weight", 1.0))
         try:
             return nx.shortest_path(sub_graph, source, target, weight="weight")
@@ -2814,6 +3678,7 @@ class DynamicTopoMap:
             "edges": edges_data,
             "current_step": self._current_step,
             "node_counter": self._node_counter,
+            "failed_target_history": list(self.failed_target_history),
         }
 
     @classmethod
@@ -2822,16 +3687,20 @@ class DynamicTopoMap:
         topo = cls(config=config)
         topo._current_step = data.get("current_step", 0)
         topo._node_counter = data.get("node_counter", 0)
+        topo.failed_target_history = list(data.get("failed_target_history", []))
         for nid, ndata in data.get("nodes", {}).items():
+            node_type = NodeType(ndata["node_type"])
+            attrs = dict(ndata.get("attributes", {}))
+            topo._standardize_layer_attributes(node_type, attrs)
             topo._nodes[nid] = SemanticNode(
                 node_id=nid,
-                node_type=NodeType(ndata["node_type"]),
+                node_type=node_type,
                 position=np.array(ndata["position"], dtype=np.float32),
                 confidence=ndata["confidence"],
                 label=ndata.get("label", ""),
                 step_id=ndata.get("step_id", 0),
                 visit_count=ndata.get("visit_count", 0),
-                attributes=ndata.get("attributes", {}),
+                attributes=attrs,
             )
             topo.graph.add_node(nid, node_type=ndata["node_type"])
         for edata in data.get("edges", []):

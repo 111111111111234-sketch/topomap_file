@@ -6,19 +6,42 @@ from typing import Optional, Sequence
 
 import numpy as np
 
-from conftopo.perception.heavy_perceiver import ObjectObservation, normalize_bbox
+from conftopo.perception.heavy_perceiver import ObjectObservation, normalize_bbox_flexible
 from conftopo.perception.perception_report import PerceptionReport
 from conftopo.perception.vlm_backend import VLMBackendBase
 
 
-def _calibrate_vlm_confidence(conf: float) -> float:
-    """VLM outputs systematically conservative confidence scores (typically
-    0.3-0.6 for correct detections).  Calibrate to better occupy the 0-1
-    range so downstream confidence computation has a wider dynamic range.
+def _estimated_display_bbox(bearing: str, range_bin: str) -> Optional[list[float]]:
+    """Approximate an on-screen box for audit overlays when VLM omits bbox.
+
+    This box is intentionally kept separate from the real detection bbox. It
+    helps visualize what the language model claimed to see, but downstream
+    stop verification still requires an actual bbox.
     """
-    if conf <= 0.0:
-        return 0.0
-    return min(1.0, conf * 1.4 + 0.05)
+    bearing_key = str(bearing or "").lower().strip()
+    range_key = str(range_bin or "").lower().strip()
+    if bearing_key in {"left", "left_front"}:
+        cx = 0.28
+    elif bearing_key in {"right", "right_front"}:
+        cx = 0.72
+    elif bearing_key in {"center", "front"}:
+        cx = 0.50
+    else:
+        return None
+    if range_key in {"very_near", "close"}:
+        bw, bh, cy = 0.36, 0.46, 0.58
+    elif range_key == "near":
+        bw, bh, cy = 0.28, 0.34, 0.56
+    elif range_key in {"mid", "medium"}:
+        bw, bh, cy = 0.22, 0.26, 0.52
+    else:
+        bw, bh, cy = 0.18, 0.20, 0.50
+    return [
+        max(0.0, cx - bw / 2.0),
+        max(0.0, cy - bh / 2.0),
+        min(1.0, cx + bw / 2.0),
+        min(1.0, cy + bh / 2.0),
+    ]
 
 
 class VLMPerceiver:
@@ -59,8 +82,9 @@ class VLMPerceiver:
             previous_rgb=previous_rgb,
             action_history=action_history,
         )
+        raw = dict(raw)
+        raw["_mode"] = mode
         if mode == "confirm" and previous_rgb is None:
-            raw = dict(raw)
             raw["relative_progress"] = "uncertain"
         return self._build_report(raw, visual_embed, step_id)
 
@@ -81,22 +105,43 @@ class VLMPerceiver:
                 relation = [relation]
             if relation is None:
                 relation = []
-            cal_conf = _calibrate_vlm_confidence(float(o.get("confidence", 0.0)))
+            confidence = max(0.0, min(1.0, float(o.get("confidence", 0.0) or 0.0)))
+            raw_bbox = (
+                o.get("bbox")
+                or o.get("box")
+                or o.get("bounding_box")
+                or o.get("bounds")
+                or o.get("coordinates")
+                or o.get("bbox_2d")
+            )
+            bbox = normalize_bbox_flexible(raw_bbox)
+            bearing = str(o.get("bearing", "unknown"))
+            range_bin = str(o.get("range", o.get("range_bin", "unknown")))
+            attributes = dict(o.get("attributes") or {})
+            if bbox is None and bool(o.get("visible", True)):
+                display_bbox = _estimated_display_bbox(bearing, range_bin)
+                if display_bbox is not None:
+                    attributes["display_bbox"] = display_bbox
+                    attributes["estimated_bbox"] = True
             objects.append(ObjectObservation(
                 label=str(o.get("label", "")),
-                bbox=normalize_bbox(o.get("bbox")),
-                confidence=cal_conf,
+                bbox=bbox,
+                confidence=confidence,
                 source="vlm",
                 step_id=step_id,
                 visible=bool(o.get("visible", True)),
                 visibility=str(o.get("visibility", "unknown")),
-                bearing=str(o.get("bearing", "unknown")),
-                range_bin=str(o.get("range", o.get("range_bin", "unknown"))),
+                bearing=bearing,
+                range_bin=range_bin,
                 spatial_relation=[str(x) for x in relation],
                 bbox_confidence=str(o.get("bbox_confidence", "medium")),
                 room_context=o.get("room_context"),
-                attributes=dict(o.get("attributes") or {}),
+                attributes=attributes,
             ))
+
+        query_ok = bool(data.get("_query_ok", True))
+        parse_ok = bool(data.get("_parse_ok", True))
+        is_full = bool(query_ok and parse_ok)
 
         return PerceptionReport(
             room_label=room_label,
@@ -113,11 +158,14 @@ class VLMPerceiver:
             stop_candidate=bool(data.get("stop_candidate", False)),
             recommended_action=str(data.get("recommended_action", "search")),
             goal_reason=str(data.get("goal_reason", "")),
-            portals=[str(p) for p in (data.get("portals") or [])],
+            portals=[
+                dict(p) if isinstance(p, dict) else {"label": str(p)}
+                for p in (data.get("portals") or [])
+            ],
             uncertainty=float(data.get("uncertainty", 0.5)),
             visual_embed=visual_embed,
             source="vlm",
-            is_full=True,
+            is_full=is_full,
             step_id=step_id,
             raw=data,
         )
