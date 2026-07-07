@@ -71,8 +71,7 @@ def test_visual_proximity_stops_without_pose_stall():
     """Visible + relevant + VLM says near AND centered -> STOP even without a
     pose-stall. This is the visual arrival path: while actively servoing toward
     the goal the pose keeps changing (pose-stall only flickers), so the coarse
-    VLM proximity judgement is what latches the stop (the v21 rack sat ~0.39 m
-    from the goal viewpoint, near+centered, yet never stopped before this)."""
+    VLM proximity judgement is what latches the stop."""
     v = StopVerifier()
     assert v.can_stop(_report(range_bin="near"), _goal(), arrived=False) is True
     assert v.last_debug["visual_arrived"] is True

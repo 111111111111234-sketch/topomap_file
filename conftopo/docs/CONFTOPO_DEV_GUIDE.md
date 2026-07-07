@@ -330,19 +330,49 @@ executor；只有 SEARCH 的 `navigate` 才走 executor 寻路。坐标系 Habit
 
 ## 11. 运行方式
 
+### 11.1 完整 smoke 运行（带 VLM + 可视化，实际常用）
+
+改一版就把 `vXX` 递增（如 `v21`→`v22`），产物落到对应目录，方便前后对比。
+
 ```bash
-cd /workspace/tangyx7@xiaopeng.com
-/opt/conda/envs/conftopo-main/bin/python scripts/run_goat_agent1_smoke_v2.py \
-  --max-goals 2 --steps-per-goal 120 --deterministic --viz \
-  --output data/logs/goat_topo/agent1_apexnav_borrow_vXX/trace.json
+conda activate goat && cd /workspace/tangyx7@xiaopeng.com && python scripts/run_goat_agent1_smoke_v2.py \
+  --scene 4ok3usBNeis --episode-index 0 \
+  --max-goals 2 --steps-per-goal 120 \
+  --perception-backend vlm \
+  --vlm-api-base http://localhost:8000/v1 \
+  --vlm-model Qwen/Qwen3-VL-8B-Instruct \
+  --clip-model ViT-B/32 --clip-image-model RN50 \
+  --deterministic --viz \
+  --output data/logs/goat_topo/agent1_apexnav_borrow_v22/trace.json
 ```
 
-- 依赖 VLM 服务在 `http://localhost:8000/v1`（Qwen3-VL-8B）。
-- **Python 环境必须用 `conftopo-main`**（base 的 `/opt/conda/bin/python` 没装 numpy）。
-- 单测（无 pytest 时可直接 import 跑函数）：
-  `.../python -c "import conftopo.tests.test_planner_rca_split as m; [getattr(m,x)() for x in dir(m) if x.startswith('test_')]"`
-- 关键产物：`trace.json`（`task_summaries` 里 `goal_stop_viewpoint_geodesic` ≤0.25 即成功）、
-  `viz/goat_semantic_audit_view.mp4`（看探索是否走出房间、是否打转/掉头）。
+参数说明：
+- `--scene 4ok3usBNeis --episode-index 0`：HM3D val 场景 + episode（当前调试用，rack/bed 两目标）。
+- `--perception-backend vlm`：走真 VLM；依赖 VLM 服务在 `http://localhost:8000/v1`（Qwen3-VL-8B）。
+- `--vlm-model` / `--clip-model` / `--clip-image-model`：VLM 与 CLIP（文本 ViT-B/32、图像 RN50）模型。
+- `--max-goals 2 --steps-per-goal 120`：跑前 2 个目标、每目标上限 120 步。
+- `--deterministic`：固定随机性，保证可复现对比。
+- `--viz`：输出可视化视频/图（见下）。
+
+> **环境**：smoke 运行用 `goat` conda 环境（含 habitat-sim + numpy）；纯单测可用
+> `/opt/conda/envs/conftopo-main/bin/python`（base 的 `/opt/conda/bin/python` 没装 numpy）。
+
+### 11.2 单测
+
+无 pytest 时可直接 import 跑函数：
+
+```bash
+cd /workspace/tangyx7@xiaopeng.com
+PYTHONPATH=. /opt/conda/envs/conftopo-main/bin/python conftopo/tests/test_stop_clip_gate.py
+# 或按模块批量跑：
+/opt/conda/envs/conftopo-main/bin/python -c "import conftopo.tests.test_planner_rca_split as m; [getattr(m,x)() for x in dir(m) if x.startswith('test_')]"
+```
+
+### 11.3 关键产物
+
+- `trace.json`：`task_summaries` 里 `goal_stop_viewpoint_geodesic` ≤0.25 即成功；
+  `goal_min_viewpoint_geodesic` 看最近逼近到多少、`goal_stopped` 看是否真停。
+- `viz/goat_semantic_audit_view.mp4`：看探索是否走出房间、是否打转/掉头、CONFIRM/STOP 行为。
 
 ---
 

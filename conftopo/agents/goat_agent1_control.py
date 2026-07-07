@@ -142,11 +142,11 @@ class StopVerifier:
         # visually servoing (turn / step / step) its pose keeps changing, so the
         # stall only flickers True for a single frame and never fills the state
         # machine's 2/3 confirm buffer (the v21 rack sat ~0.39 m from the goal
-        # viewpoint with the VLM screaming "near, centered, stop_candidate" for
-        # ~10 frames yet never stopped). Path (b) trusts the VLM's own coarse
-        # distance judgement -- which is what the whole approach is built on -- so
-        # we stop once we are demonstrably close and looking at the goal. We still
-        # avoid the discredited absolute-depth / bbox-area / CLIP gates.
+        # viewpoint with the VLM screaming "near, centered" for ~10 frames yet
+        # never stopped). Path (b) trusts the VLM's own coarse distance judgement
+        # -- which is what the whole approach is built on -- so we stop once we
+        # are demonstrably close and looking at the goal. We still avoid the
+        # discredited absolute-depth / bbox-area / CLIP gates.
         box = bbox_override if bbox_override is not None else obj.get("bbox")
         center = bbox_center_x(box)
         range_bin = str(obj.get("range_bin", "")).lower()
