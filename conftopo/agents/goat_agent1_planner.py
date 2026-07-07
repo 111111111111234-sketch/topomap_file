@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-from conftopo.agents.goat_agent1_memory import GoalRelevanceScorer
+from conftopo.agents.goat_agent1_memory import GoalRelevanceScorer, _goal_id
 from conftopo.agents.goat_agent1_types import (
     ActiveTopoView,
     AgentPose,
@@ -23,6 +24,37 @@ from conftopo.core.instruction_graph import GoalNode
 
 def distance(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.linalg.norm(np.asarray(a, dtype=np.float32) - np.asarray(b, dtype=np.float32)))
+
+
+def frontier_novelty(topo_map: Optional["DynamicTopoMap"], node: "SemanticNode", pose: "AgentPose") -> float:
+    """Genuine unexplored-ness: how far this frontier sits from the NEAREST place
+    we've already visited (rewards opening up new area), NOT merely how far it is
+    from the agent's current spot. Every ~2.3 m local frontier is trivially far
+    from the agent, so the old (dist-from-agent) novelty could not distinguish a
+    frontier pushing into new space from one hugging already-explored area -- a
+    key reason exploration circled inside one room."""
+    if topo_map is not None:
+        nearest = topo_map.find_nearest_node(node.position, node_type=NodeType.WAYPOINT_VISITED)
+        if nearest is not None:
+            d = distance(node.position, nearest.position)
+            return float(max(0.0, min(1.0, d / 3.0)))
+    from_agent = distance(pose.position, node.position)
+    return float(max(0.0, min(1.0, (from_agent - 1.2) / 4.0)))
+
+
+def heading_alignment(pose: "AgentPose", position: np.ndarray) -> float:
+    """cos(angle) between the agent's forward heading and the direction to
+    `position` (xz plane): +1 straight ahead, 0 to the side, -1 directly behind.
+    Used to discourage picking an exploration frontier that requires turning back
+    the way we came ("刚出门就掉头")."""
+    dx = float(position[0] - pose.position[0])
+    dz = float(position[2] - pose.position[2])
+    norm = math.hypot(dx, dz)
+    if norm < 1e-6:
+        return 1.0
+    fwd_x = -math.sin(float(pose.heading))
+    fwd_z = -math.cos(float(pose.heading))
+    return float((dx * fwd_x + dz * fwd_z) / norm)
 
 
 def cosine_similarity(a: Any, b: Any) -> float:
@@ -42,6 +74,13 @@ def cosine_similarity(a: Any, b: Any) -> float:
 
 
 PORTAL_NEAR_VISITED_RADIUS = 0.85
+
+# Floor of the reliability discount in the task-conditioned confidence fusion
+# (see ``task_confidence``). A semantically-matching but only-glimpsed candidate
+# (high R, low existence e) must not collapse to ~0 -- it should stay medium so
+# the agent goes to verify it. The floor sets how much a perfect semantic match
+# is worth on its own before any corroboration.
+TASK_CONF_RELIABILITY_FLOOR = 0.45
 
 
 def _view_excludes(active_view: Optional[ActiveTopoView], node_id: Optional[str]) -> bool:
@@ -115,14 +154,14 @@ class StructurePlanner:
                 continue
             if _view_excludes(active_view, node.node_id):
                 continue
-            retrieval = _object_retrieval_score(node, goal)
-            relevance = float(retrieval["score"])
-            has_embedding_evidence = bool(retrieval["visual_similarity"] > 0.0 or retrieval["text_similarity"] > 0.0)
-            attribute_similarity = float(retrieval["attribute_similarity"])
-            if has_embedding_evidence:
-                if relevance < 0.12:
-                    continue
-            elif attribute_similarity < 0.65:
+            # Task-conditioned confidence drives the ranking: R (semantic match to
+            # the goal) is fused *multiplicatively* with e (existence/corroboration
+            # confidence). A semantic mismatch collapses c_task regardless of how
+            # sure we are the object exists, so unrelated objects no longer
+            # out-score exploration and the agent is free to leave the room; a
+            # strong-but-under-observed match stays medium and is worth verifying.
+            relevance = object_goal_relevance(node, goal)
+            if relevance <= 0.0:
                 continue
             nav = topo_map.navigation_target_for_structure_node(node.node_id)
             if nav is None:
@@ -130,10 +169,10 @@ class StructurePlanner:
             failed = int(node.attributes.get("failed_count", 0) or 0)
             unreachable = int(node.attributes.get("unreachable_count", 0) or 0)
             dist = distance(pose.position, nav.position)
-            # Explicit C / R / A axes (blend identical to the legacy formula).
-            map_conf = object_map_confidence(node)
+            existence = float(node.confidence)
+            c_task = object_c_task(node, goal)
             reach_penalty = object_reachability_penalty(node, nav.node_id)
-            score = object_intent_score(relevance, map_conf, reach_penalty, dist)
+            score = c_task - 0.035 * dist - reach_penalty
             out.append(SearchIntent(
                 intent_type="object",
                 target_label=node.label,
@@ -142,10 +181,8 @@ class StructurePlanner:
                 target_position=nav.position.copy(),
                 score=score,
                 reason=(
-                    f"object_memory:{node.label}; open_vocab={relevance:.2f}; "
-                    f"visual={retrieval['visual_similarity']:.2f}; text={retrieval['text_similarity']:.2f}; "
-                    f"attr={attribute_similarity:.2f}; room={retrieval['room_consistency']:.2f}; "
-                    f"conf={node.confidence:.2f}; failed={failed}; unreachable={unreachable}"
+                    f"object_memory:{node.label}; c_task={c_task:.2f}; R={relevance:.2f}; e={existence:.2f}; "
+                    f"failed={failed}; unreachable={unreachable}"
                 ),
                 preferred_room=node.attributes.get("room_label"),
                 evidence_refs=[node.node_id],
@@ -319,10 +356,18 @@ class StructurePlanner:
             anchor = topo_map.get_node(hyp.anchor_node_id)
             if anchor is None or anchor.node_type not in topo_map._NAV_NODE_TYPES:
                 continue
-            if hyp.kind == "object" and GoalRelevanceScorer.label_relevance(hyp.label, goal) < 0.15:
+            hyp_relevance = GoalRelevanceScorer.label_relevance(hyp.label, goal)
+            if hyp.kind == "object" and hyp_relevance < 0.15:
                 continue
             dist = distance(pose.position, anchor.position)
-            score = 0.20 + 0.40 * float(hyp.confidence) + min(0.12, 0.03 * hyp.seen_count) - 0.03 * dist
+            if hyp.kind == "object":
+                # Same task-conditioned confidence as confirmed objects, but on a
+                # low-existence guess: a strong semantic match still reads as a
+                # medium c_task worth going to verify.
+                c_task = hypothesis_c_task(hyp, goal)
+                score = c_task + min(0.12, 0.03 * hyp.seen_count) - 0.03 * dist
+            else:
+                score = 0.20 + 0.40 * float(hyp.confidence) + min(0.12, 0.03 * hyp.seen_count) - 0.03 * dist
             out.append(SearchIntent(
                 intent_type="hypothesis",
                 target_label=hyp.label,
@@ -367,13 +412,14 @@ class StructurePlanner:
             failed = float(node.attributes.get("failed_count", 0) or 0)
             unreachable = float(node.attributes.get("unreachable_count", 0) or 0)
             visits = float(node.attributes.get("visit_count", node.visit_count) or 0)
-            novelty = float(max(0.0, min(1.0, (dist - 1.2) / 4.0)))
+            novelty = frontier_novelty(topo_map, node, pose)
+            heading_align = heading_alignment(pose, node.position)
             recent = float(recent_counts.get(node.node_id, 0))
             stale_penalty = 0.35 if node.node_id in stale_ids else 0.0
             risk = frontier_reachability_penalty(failed, unreachable, visits, recent, stale_penalty)
             relevance = frontier_task_relevance(semantic)
             map_conf = frontier_map_confidence(frontier_conf)
-            score = frontier_intent_score(relevance, map_conf, novelty, dist, risk)
+            score = frontier_intent_score(relevance, map_conf, novelty, dist, risk, heading_align)
             if score > best_score:
                 best_score = score
                 best_node = node
@@ -384,7 +430,8 @@ class StructurePlanner:
                     )
                 best_reason = (
                     f"explore_frontier:{node.node_id}; conf={frontier_conf:.2f}; "
-                    f"semantic={semantic:.2f}; novelty={novelty:.2f}; risk={risk:.2f}; recent={recent:.0f}"
+                    f"semantic={semantic:.2f}; novelty={novelty:.2f}; heading={heading_align:.2f}; "
+                    f"risk={risk:.2f}; recent={recent:.0f}"
                 )
         return SearchIntent(
             intent_type="explore",
@@ -640,8 +687,21 @@ class NavigationPlanner:
                     continue
                 near_anchor_offsets.setdefault(neighbor.node_id, neighbor)
         target_type = "object_anchor" if intent.intent_type == "object" else f"{intent.intent_type}_waypoint"
+        # Prefer the intent's chosen anchor (for committed objects this is the
+        # real OBSERVATION waypoint) over other structure anchors like the
+        # estimated approach point, so navigation heads to where we actually saw
+        # the object rather than a fabricated stand-off.
         proposals = [
-            self._proposal(node, intent, pose, planning_context, target_type, 1.0, f"{intent.intent_type}_anchor:{node.node_id}", topo_map=topo_map)
+            self._proposal(
+                node,
+                intent,
+                pose,
+                planning_context,
+                target_type,
+                1.0 if node.node_id == intent.preferred_anchor_waypoint_id else 0.82,
+                f"{intent.intent_type}_anchor:{node.node_id}",
+                topo_map=topo_map,
+            )
             for node in dedup.values()
         ]
         offset_type = "object_anchor_offset" if intent.intent_type == "object" else f"{intent.intent_type}_offset"
@@ -759,7 +819,11 @@ class NavigationPlanner:
         blocked = 1.0 if node.attributes.get("blocked", False) else 0.0
         visits = float(node.attributes.get("visit_count", node.visit_count) or 0)
         frontier_value = float(node.confidence) if node.node_type == NodeType.WAYPOINT_FRONTIER else 0.0
-        novelty = self._novelty(node, pose) if node.node_type == NodeType.WAYPOINT_FRONTIER else 0.0
+        is_frontier = node.node_type == NodeType.WAYPOINT_FRONTIER
+        novelty = frontier_novelty(topo_map, node, pose) if is_frontier else 0.0
+        # Direction continuity applies to exploration frontiers only: goal / region
+        # targets (tier 1) must always be pursued regardless of heading.
+        heading_align = heading_alignment(pose, node.position) if (is_frontier and pose is not None) else 0.0
         recent = float((planning_context.recent_target_counts or {}).get(node.node_id, 0)) if planning_context else 0.0
         stale = bool(planning_context and node.node_id in planning_context.stale_target_ids)
         current_wp = planning_context.current_waypoint_id if planning_context else None
@@ -780,6 +844,7 @@ class NavigationPlanner:
             + 0.22 * float(intent.score)
             + 0.20 * frontier_value
             + 0.16 * novelty
+            + 0.20 * heading_align
             + unvisited_bonus
             + 0.35 * max(0.0, 1.0 - blocked - 0.2 * unreachable)
             - 0.035 * dist
@@ -796,8 +861,8 @@ class NavigationPlanner:
             score=score,
             reason=(
                 f"{reason}; score={score:.2f}; dist={dist:.2f}; novelty={novelty:.2f}; "
-                f"visits={visits:.0f}; failed={failed:.0f}; recent={recent:.0f}; "
-                f"stale={int(stale)}; unvisited_bonus={unvisited_bonus:.2f}"
+                f"heading={heading_align:.2f}; visits={visits:.0f}; failed={failed:.0f}; "
+                f"recent={recent:.0f}; stale={int(stale)}; unvisited_bonus={unvisited_bonus:.2f}"
             ),
             source_intent=intent,
             structure_node_id=intent.structure_node_id,
@@ -829,10 +894,6 @@ class NavigationPlanner:
         ):
             return False
         return True
-
-    def _novelty(self, node: SemanticNode, pose: AgentPose) -> float:
-        from_agent = distance(pose.position, node.position)
-        return float(max(0.0, min(1.0, (from_agent - 1.2) / 4.0)))
 
     def _unvisited_neighbor_bonus(self, topo_map: Optional[DynamicTopoMap], node: SemanticNode) -> float:
         if topo_map is None:
@@ -995,24 +1056,44 @@ def _label_bonus(label: Any, goal: GoalNode) -> float:
 
 
 # --- Explicit C / R / A decomposition for the object intent ------------------
-# These split the three signals that used to be entangled inside one scalar in
-# ``_object_intents``:
+# These expose the object signals as separate axes so ActiveTopo can read each
+# independently instead of re-deriving a blend:
 #   R (task relevance)       -> object_task_relevance
 #   C (map confidence)       -> object_map_confidence
 #   A (reachability penalty) -> object_reachability_penalty
-# The planner still blends them into one ranking score via ``object_intent_score``
-# (arithmetic unchanged), but ActiveTopo can now read each axis independently
-# instead of re-deriving the blend.
+# The planner ranks objects by task-conditioned confidence (``object_c_task`` /
+# ``_object_intents``), not an additive blend.
 
 def object_task_relevance(node: SemanticNode, goal: GoalNode) -> float:
     """R: relevance of this object node to the current goal (0..1)."""
     return float(_object_retrieval_score(node, goal)["score"])
 
 
+# FOV-weighted confidence saturation constant (ApexNav / VLFM style). Larger K
+# means more central observations are needed to reach the corroboration cap.
+OBJECT_FOV_MASS_K = 2.0
+
+
 def object_map_confidence(node: SemanticNode) -> float:
-    """C: map-confidence contribution (detection confidence + multi-view evidence)."""
-    multi_view = int(node.attributes.get("multi_view_count", node.visit_count or 1) or 1)
-    return 0.30 * float(node.confidence) + min(0.20, 0.04 * multi_view)
+    """C: map-confidence contribution.
+
+    ApexNav / VLFM-style fusion: instead of counting every re-detection equally
+    (legacy ``0.04 * multi_view``), we read a FOV/center-weighted value ``V``
+    (running mean of detection scores weighted by how centered each observation
+    was) and an accumulated view mass ``M`` (central views add ~1, edge glimpses
+    add ~0). The corroboration bonus saturates in ``M`` so repeated *central*
+    views drive C up while glancing edge detections barely count.
+
+    Falls back to the legacy formula (ULP-identical) for nodes that predate the
+    FOV accumulator so old maps / tests stay stable.
+    """
+    mass = node.attributes.get("fov_view_mass")
+    value = node.attributes.get("fov_value_v")
+    if mass is None or value is None:
+        multi_view = int(node.attributes.get("multi_view_count", node.visit_count or 1) or 1)
+        return 0.30 * float(node.confidence) + min(0.20, 0.04 * multi_view)
+    m = float(mass)
+    return 0.30 * float(value) + min(0.20, 0.20 * (m / (m + OBJECT_FOV_MASS_K)))
 
 
 def object_reachability_penalty(node: SemanticNode, anchor_node_id: Optional[str]) -> float:
@@ -1024,19 +1105,64 @@ def object_reachability_penalty(node: SemanticNode, anchor_node_id: Optional[str
     return 0.25 * failed + 0.75 * unreachable + anchor_penalty
 
 
-def object_intent_score(
-    relevance: float,
-    map_confidence: float,
-    reachability_penalty: float,
-    distance_to_anchor: float,
-) -> float:
-    """Blend R / C / A / proximity exactly as the legacy inline formula did."""
-    return (
-        0.85 * relevance
-        + map_confidence
-        - 0.035 * distance_to_anchor
-        - reachability_penalty
+def task_confidence(relevance: float, existence: float) -> float:
+    """Task-conditioned confidence c = P(this node is the goal | evidence).
+
+    Fuses the two signals that used to be *added* (``R + C``) into a single
+    number, the way the project's premise ("task-driven confidence navigation")
+    actually intends:
+
+      * ``relevance`` (R): how well the node matches the goal semantically. It is
+        *multiplicative* -- a semantic mismatch (R -> 0) drives c to ~0 no matter
+        how certain we are that the thing exists, so an unrelated-but-well-seen
+        object can no longer out-score exploration.
+      * ``existence`` (e): how reliable the detection is (corroboration). It only
+        *discounts* c, bounded below by ``TASK_CONF_RELIABILITY_FLOOR`` so a
+        strong semantic match that is merely under-observed stays medium -- worth
+        approaching to verify rather than being killed.
+
+    Additive R + C could not express either behaviour (a high-C chair and a
+    low-C bed ended up with similar totals). c = R * (floor + (1-floor)*e) does.
+    """
+    r = max(0.0, min(1.0, float(relevance)))
+    e = max(0.0, min(1.0, float(existence)))
+    reliability = TASK_CONF_RELIABILITY_FLOOR + (1.0 - TASK_CONF_RELIABILITY_FLOOR) * e
+    return r * reliability
+
+
+def object_goal_relevance(node: SemanticNode, goal: GoalNode) -> float:
+    """R for the task-confidence fusion, chosen by goal modality.
+
+    * category (a noun like "bed"): use the clean, discrete label relevance
+      (bed=1.0, mattress=0.8, unrelated furniture=0.0). Embedding-only similarity
+      gave generic objects ~0.5 and hijacked navigation, so it must not drive R
+      for noun goals.
+    * image / description: no reliable text label to match, so fall back to the
+      multimodal embedding retrieval blend (``object_task_relevance``).
+    """
+    goal_type = str(getattr(goal, "goal_type", "category") or "category").lower().strip()
+    if goal_type in ("image", "description"):
+        return object_task_relevance(node, goal)
+    return float(GoalRelevanceScorer.label_relevance(str(node.label or ""), goal))
+
+
+def object_c_task(node: SemanticNode, goal: GoalNode) -> float:
+    """Single source of truth for a confirmed object's task-conditioned
+    confidence: goal relevance (modality-aware) fused with existence confidence.
+    Used by both the planner ranking and the agent's sticky lock."""
+    return float(task_confidence(object_goal_relevance(node, goal), float(node.confidence)))
+
+
+def hypothesis_c_task(hyp: Any, goal: GoalNode) -> float:
+    """Task-conditioned confidence for a goal hypothesis. Object-kind guesses use
+    their label relevance to the goal; goal-directed (e.g. goal_view) guesses are
+    inherently relevant (R=1). Shared by the planner and the agent's sticky lock."""
+    r = (
+        GoalRelevanceScorer.label_relevance(str(getattr(hyp, "label", "") or ""), goal)
+        if getattr(hyp, "kind", "object") == "object"
+        else 1.0
     )
+    return float(task_confidence(r, float(getattr(hyp, "confidence", 0.0))))
 
 
 # --- Explicit C / R / A decomposition for room / landmark / portal / frontier -
@@ -1145,18 +1271,14 @@ def frontier_intent_score(
     novelty: float,
     dist: float,
     reachability_penalty: float,
+    heading_align: float = 0.0,
 ) -> float:
     return (
         0.18
         + map_confidence
         + relevance
         + 0.18 * novelty
+        + 0.20 * heading_align
         - 0.025 * dist
         - reachability_penalty
     )
-
-
-def _goal_id(goal: Optional[GoalNode]) -> Optional[str]:
-    if goal is None:
-        return None
-    return str(goal.image_cache_key or goal.goal_image_id or goal.target_object)

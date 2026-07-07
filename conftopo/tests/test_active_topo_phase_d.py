@@ -100,10 +100,10 @@ def test_verification_failure_lowers_confidence_and_marks_negative():
 # --------------------------------------------------------------------------- #
 # 3. state-machine VERIFY loop (deterministic)
 # --------------------------------------------------------------------------- #
-def _report(*, range_bin="near"):
+def _report(*, range_bin="close"):
     obj = ObjectObservation(
         label="chair",
-        bbox=[0.40, 0.40, 0.60, 0.70],
+        bbox=[0.40, 0.20, 0.60, 0.90],  # centered (center_x=0.5); size no longer used
         confidence=0.80,
         visibility="visible",
         range_bin=range_bin,
@@ -132,7 +132,8 @@ def test_verify_target_requires_full_buffer_and_fires_success():
     stops_base = None
     for step in range(1, 8):
         act = sm_base.act(step_id=step, target=target, report=_report(), goal=goal,
-                          fresh_report=True, needs_verify=False)
+                          fresh_report=True, needs_verify=False, arrived=True,
+                          center_depth=0.6)
         if act["action"] == "stop":
             stops_base = step
             break
@@ -144,7 +145,7 @@ def test_verify_target_requires_full_buffer_and_fires_success():
     for step in range(1, 8):
         act = sm.act(
             step_id=step, target=target, report=_report(), goal=goal,
-            fresh_report=True, needs_verify=True,
+            fresh_report=True, needs_verify=True, arrived=True, center_depth=0.6,
             on_verify_success=lambda: fired.__setitem__("ok", fired["ok"] + 1),
             on_verify_failure=lambda: fired.__setitem__("fail", fired["fail"] + 1),
         )
@@ -162,7 +163,7 @@ def test_verify_target_failure_writes_negative():
     sm = StateMachine()
     fired = {"ok": 0, "fail": 0}
     for step in range(1, 15):
-        # visible but never stoppable (mid range -> not "near")
+        # visible but never stoppable (arrived defaults False -> no proximity)
         sm.act(
             step_id=step, target=target, report=_report(range_bin="mid"), goal=goal,
             fresh_report=True, needs_verify=True,

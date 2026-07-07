@@ -617,15 +617,35 @@ class DynamicTopoMap:
 
         nearby = self.find_nodes_within_radius(wp.position, radius=radius, node_type=NodeType.ROOM)
         room = None
-        best_match = -1.0
+        # Rooms are physical regions. Merge primarily by SPATIAL proximity: if a
+        # room node already sits close to this waypoint, fold into it regardless
+        # of how the per-view room label came out. Per-view VLM room labels are
+        # noisy (the same spot reads "hallway" then "utility room" then
+        # "bedroom"), and gating the merge on label-distribution similarity used
+        # to spawn a fresh room node for every fluctuation -- 7 co-located rooms
+        # inside ~2m, which in turn spawned dozens of auto-portals between them.
+        spatial_merge = max(self.merge_radius * 2.0, 2.0)
+        nearest = None
+        nearest_dist = float("inf")
         for candidate in nearby:
-            cand_probs = _normalizable_score_dict(candidate.attributes.get("room_probs", {}))
-            sim = _prob_similarity(normalized_scores, cand_probs)
-            if sim > best_match:
-                best_match = sim
-                room = candidate
-        if room is not None and best_match < 0.35:
-            room = None
+            d = float(np.linalg.norm(candidate.position - wp.position))
+            if d < nearest_dist:
+                nearest_dist = d
+                nearest = candidate
+        if nearest is not None and nearest_dist <= spatial_merge:
+            room = nearest
+        else:
+            # Farther apart: only merge if the room-label distributions agree,
+            # so genuinely distinct adjacent rooms stay separate.
+            best_match = -1.0
+            for candidate in nearby:
+                cand_probs = _normalizable_score_dict(candidate.attributes.get("room_probs", {}))
+                sim = _prob_similarity(normalized_scores, cand_probs)
+                if sim > best_match:
+                    best_match = sim
+                    room = candidate
+            if room is not None and best_match < 0.35:
+                room = None
 
         if room is None:
             room_id = self.add_node(

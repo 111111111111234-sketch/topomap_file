@@ -35,6 +35,46 @@ def bbox_center_x(bbox: Any) -> Optional[float]:
     return 0.5 * (x1 + x2)
 
 
+def object_fov_weight(bbox: Any) -> float:
+    """Per-observation FOV/center confidence in [0, 1] (VLFM cos^2 model).
+
+    Uses the detection's horizontal bbox center as an in-FOV angle proxy:
+    the image center maps to ~1.0 and the image edge to ~0.0, mirroring
+    ApexNav's ``cos^2(relative_angle / (fov/2) * pi/2)``. Unknown bbox -> 0.5.
+    """
+    cx = bbox_center_x(bbox)
+    if cx is None:
+        return 0.5
+    theta = float(np.clip((cx - 0.5) / 0.5, -1.0, 1.0))
+    w = float(np.cos(theta * (np.pi / 2.0)) ** 2)
+    return max(w, 1e-3)
+
+
+def accumulate_object_fov_confidence(
+    node: Optional[SemanticNode],
+    *,
+    bbox: Any,
+    detection_score: float,
+) -> None:
+    """Fold one observation into the node's FOV-weighted confidence accumulator.
+
+    Maintains ``fov_view_mass`` (M = sum of per-view center weights) and
+    ``fov_value_v`` (V = FOV-weighted running mean of detection scores). These
+    are read back by ``object_map_confidence`` so central, repeated observations
+    build confidence while glancing edge detections barely count.
+    """
+    if node is None or not isinstance(node.attributes, dict):
+        return
+    w = object_fov_weight(bbox)
+    m_last = float(node.attributes.get("fov_view_mass", 0.0) or 0.0)
+    v_last = float(node.attributes.get("fov_value_v", 0.0) or 0.0)
+    v_now = float(detection_score or 0.0)
+    m_new = m_last + w
+    v_new = (w * v_now + m_last * v_last) / m_new if m_new > 0.0 else v_now
+    node.attributes["fov_view_mass"] = m_new
+    node.attributes["fov_value_v"] = float(np.clip(v_new, 0.0, 1.0))
+
+
 def bbox_edge_clipped(bbox: Any) -> bool:
     if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
         return False
@@ -57,6 +97,12 @@ def range_bin_distance(range_bin: str) -> float:
     if key == "far":
         return 3.2
     return 1.5
+
+
+# Two portal observations whose estimated doorway positions fall within this
+# distance are treated as the same opening and merged, instead of spawning a
+# new portal node per frame.
+PORTAL_MERGE_RADIUS = 1.5
 
 
 def estimate_object_position(pose: AgentPose, obj: Dict[str, Any]) -> np.ndarray:
@@ -288,24 +334,10 @@ class GoalEvidenceFilter:
         "through doorway", "behind doorway", "behind door",
         "through door", "through opening", "in doorway",
     )
-    BED_FLOOR_WORDS = {"rug", "carpet", "floor", "mat", "stairs", "stair"}
-    BED_WORDS = {
-        "bed", "mattress", "sheet", "sheets", "bedding",
-        "pillow", "pillows", "blanket", "headboard",
-    }
-    RACK_IMPOSSIBLE = ("above doorway", "on ceiling", "on wall")
 
     @staticmethod
     def _relation_text(obj: Dict[str, Any]) -> str:
         return " ".join(str(x).lower() for x in obj.get("spatial_relation", []) or [])
-
-    @staticmethod
-    def _description_text(obj: Dict[str, Any]) -> str:
-        attrs = obj.get("attributes") or {}
-        desc = attrs.get("description", "") if isinstance(attrs, dict) else ""
-        if isinstance(desc, dict):
-            desc = desc.get("value", "")
-        return str(desc or "").lower()
 
     @classmethod
     def doorway_view(cls, obj: Dict[str, Any]) -> bool:
@@ -313,29 +345,16 @@ class GoalEvidenceFilter:
         return any(phrase in relation_text for phrase in cls.DOORWAY_PHRASES)
 
     @classmethod
-    def label_conflict(cls, obj: Dict[str, Any], goal: Optional[GoalNode]) -> bool:
-        """True when label/description contradicts the goal (e.g. bed-on-floor)."""
-        label = GoalRelevanceScorer._clean(obj.get("label"))
-        goal_key = GoalRelevanceScorer._clean(getattr(goal, "target_object", ""))
-        relation_text = cls._relation_text(obj)
-        text = " ".join([label, cls._description_text(obj), relation_text])
-        if goal_key == "bed" or label == "bed":
-            if any(word in relation_text for word in cls.BED_FLOOR_WORDS):
-                return True
-            if any(word in text for word in cls.BED_FLOOR_WORDS) and not any(
-                word in text for word in cls.BED_WORDS
-            ):
-                return True
-            if any(word in label for word in cls.BED_FLOOR_WORDS):
-                return True
-        if goal_key == "rack" or label == "rack":
-            if any(phrase in text for phrase in cls.RACK_IMPOSSIBLE):
-                return True
-        return False
-
-    @classmethod
     def is_usable_detection(cls, obj: Dict[str, Any], goal: Optional[GoalNode]) -> bool:
-        """Full geometric + semantic gate for treating a detection as the goal."""
+        """Generic geometric + visibility gate for treating a detection as the goal.
+
+        Deliberately object-agnostic: no per-target-object impossibility rules
+        (e.g. "a rack can't be on a wall", "a bed can't be on the floor"). Such
+        hardcoded constraints reject legitimate targets (a wall-mounted rack is a
+        real rack). Only generic, target-independent evidence quality is checked:
+        box area / confidence / visibility / edge-clipping / rough centering, plus
+        a generic "seen through a doorway" occlusion guard.
+        """
         bbox_conf = str(obj.get("bbox_confidence", "")).lower()
         bearing = str(obj.get("bearing", "")).lower()
         visibility = str(obj.get("visibility", "")).lower()
@@ -350,15 +369,6 @@ class GoalEvidenceFilter:
         if bbox_edge_clipped(obj.get("bbox")) and side_bearing:
             return False
         if center is not None and not 0.12 <= center <= 0.88:
-            return False
-        if cls.label_conflict(obj, goal):
-            return False
-
-        goal_key = GoalRelevanceScorer._clean(getattr(goal, "target_object", ""))
-        relation_text = cls._relation_text(obj)
-        if goal_key == "rack" and "doorway" in relation_text and (
-            bbox_conf != "high" or side_bearing
-        ):
             return False
         if cls.doorway_view(obj) and (bbox_conf != "high" or side_bearing):
             return False
@@ -397,9 +407,6 @@ class ObjectPromotionPolicy:
                 "floor mat", "light switch", "ceiling light", "corridor",
             )
         )
-
-    def label_description_conflict(self, obj: Dict[str, Any], *, goal: Optional[GoalNode]) -> bool:
-        return GoalEvidenceFilter.label_conflict(obj, goal)
 
     def should_promote_object(self, obj: Dict[str, Any], *, seen_count: int) -> bool:
         label = GoalRelevanceScorer._clean(obj.get("label"))
@@ -484,6 +491,9 @@ class Agent1MemoryWriter:
             attrs["verify_success_count"] = int(attrs.get("verify_success_count", 0) or 0) + 1
             target = max(float(detection_score), float(node.confidence))
             new_conf = update_on_observation(float(node.confidence), target, is_consistent=True)
+            # A passed VERIFY is a fresh corroboration -> fold it into the
+            # FOV-weighted confidence accumulator using the last observed bbox.
+            accumulate_object_fov_confidence(node, bbox=attrs.get("last_bbox") or attrs.get("bbox"), detection_score=target)
         else:
             attrs["verify_fail_count"] = int(attrs.get("verify_fail_count", 0) or 0) + 1
             prev_neg = float(attrs.get("strong_negative_evidence", 0.0) or 0.0)
@@ -633,7 +643,14 @@ class Agent1MemoryWriter:
             if not self.promotion.should_promote_object(obj, seen_count=seen_count):
                 continue
             estimated_position = estimate_object_position(pose, obj)
-            position = pose.position.copy()
+            # Anchor the object node at its estimated world location (projected
+            # forward from the viewing pose along the detection ray), NOT at the
+            # agent's own pose. Anchoring at the observation pose used to place the
+            # object ~1.5m short, so the derived approach point sat a viewing
+            # distance away and the agent stopped without closing in. With the
+            # estimate here, compute_best_approach can back off a small standoff
+            # and snap onto the navmesh right next to the object.
+            position = estimated_position.copy()
             visual_embedding = _embedding_from_value(obj.get("embedding"))
             if visual_embedding is None and object_crop_encoder is not None:
                 visual_embedding = object_crop_encoder(rgb, obj.get("bbox"))
@@ -693,6 +710,18 @@ class Agent1MemoryWriter:
                 node.attributes["seen_count"] = int(node.attributes.get("multi_view_count", 1) or 1)
                 node.attributes["visual_embedding_source"] = object_attrs["visual_embedding_source"]
                 node.attributes["text_embedding_source"] = object_attrs["text_embedding_source"]
+                accumulate_object_fov_confidence(
+                    node,
+                    bbox=obj.get("bbox"),
+                    detection_score=float(obj.get("confidence", 0.0) or 0.0),
+                )
+                # Materialise the stand-off approach point as a navigation node.
+                # object_memory.upsert only stores best_approach_position on the
+                # object node; navigation resolves an object to its
+                # approach_point_id, so without this sync the planner would fall
+                # back to the observation waypoint (~viewing distance away) and
+                # the agent would never close in.
+                self.topo_map._sync_approach_point(node_id, waypoint_id, position)
             self.topo_map.cross_layer.bind_object_to_anchor(node_id, waypoint_id)
             self.topo_map.cross_layer.bind_object_observation(node_id, waypoint_id)
             room_id = self._room_id_for_waypoint(waypoint_id)
@@ -722,8 +751,6 @@ class Agent1MemoryWriter:
         label = str(obj.get("label", ""))
         relevance = GoalRelevanceScorer.label_relevance(label, goal)
         if relevance < 0.65:
-            return
-        if self.promotion.label_description_conflict(obj, goal=goal):
             return
         self.hypothesis_pool.add_or_update(Hypothesis(
             id="",
@@ -765,17 +792,33 @@ class Agent1MemoryWriter:
         state = str(portal.get("state", "uncertain")).lower()
         portal_type = str(portal.get("type", "unknown")).lower()
         traversable = bool(portal.get("traversable", state == "open"))
-        pos = pose.position.copy()
+        # Anchor the portal at the estimated doorway location (projected forward
+        # from the viewing pose along the reported bearing), NOT at the agent's
+        # own pose. Pinning portals to the pose used to stack a fresh node at
+        # every spot the agent happened to stand when the VLM mentioned an
+        # opening, producing dozens of mislocated near-duplicates.
+        pos = estimate_object_position(pose, portal)
         attrs = {
             "room_hint": room_label,
             "portal_requires_beyond_waypoint": False,
-            "position_source": "observation_anchor",
+            "position_source": "forward_projection",
             "position_confirmed": False,
             "portal_type": portal_type,
             "portal_state": state,
             "bearing": bearing,
             "traversable": traversable,
         }
+        # Reuse the nearest existing portal instead of creating a duplicate for
+        # every frame that reports an opening. Doorways observed from far-apart
+        # poses (> PORTAL_MERGE_RADIUS) still register as distinct portals.
+        reuse_id = None
+        existing = self.topo_map.find_nodes_within_radius(
+            pos, PORTAL_MERGE_RADIUS, NodeType.PORTAL,
+        )
+        if existing:
+            reuse_id = min(
+                existing, key=lambda n: float(np.linalg.norm(n.position - pos))
+            ).node_id
         portal_id = self.topo_map.structure_layer.add_or_update_portal_node(
             label=label or "portal",
             confidence=0.55,
@@ -783,6 +826,7 @@ class Agent1MemoryWriter:
             observed_from_waypoint_id=waypoint_id,
             connected_waypoint_id=waypoint_id,
             attributes=attrs,
+            node_id=reuse_id,
         )
         portal = self.topo_map.get_node(portal_id)
         if portal is not None:

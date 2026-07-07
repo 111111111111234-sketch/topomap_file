@@ -279,8 +279,18 @@ def normalize_bbox_flexible(raw: Any) -> Optional[List[float]]:
     else:
         return None
 
-    # --- strict validation ---
+    # Auto-detect coordinate scale. Qwen-VL family natively emits 0-1000 boxes;
+    # some models use 0-100. Rescale into [0, 1] instead of rejecting the whole
+    # box (which would drop the detection entirely for that frame).
     import math
+    _finite = [v for v in raw[:4] if math.isfinite(v)]
+    if _finite:
+        _m = max(abs(v) for v in _finite)
+        if _m > 1.05:
+            _divisor = 1000.0 if _m > 100.0 else 100.0
+            raw = [v / _divisor for v in raw[:4]]
+
+    # --- strict validation ---
     clamped = False
     out = []
     for v in raw[:4]:

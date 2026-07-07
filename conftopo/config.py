@@ -96,6 +96,19 @@ class PerceptionConfig:
     # reproducible VLM outputs for deterministic regression baselines.
     vlm_temperature: float = 0.1
     vlm_seed: Optional[int] = None
+    # Independent CLIP crop-vs-goal STOP gate (ApexNav target-centric idea).
+    # Vetoes a STOP only when we have both a crop embedding and a goal embedding
+    # and their cosine is clearly below the goal-type threshold; otherwise it is
+    # a no-op. Image goals compare image-image (high scale); category/description
+    # compare image-text (lower scale), hence two thresholds.
+    stop_clip_gate_enabled: bool = True
+    stop_clip_min_image: float = 0.55
+    # Text/image CLIP cosines are inherently low: even a true target crop vs the
+    # goal text sits around ~0.20-0.21 (observed in smoke traces). Far-object
+    # false-positives are blocked by the arrival proximity gate, so this
+    # threshold only needs to sit just under the true-positive band to let
+    # legitimate close-range stops through.
+    stop_clip_min_text: float = 0.18
 
 
 @dataclass

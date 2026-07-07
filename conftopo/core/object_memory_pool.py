@@ -28,6 +28,13 @@ def _node_type():
     from conftopo.core.dynamic_topo_map import NodeType
     return NodeType
 
+# Desired stand-off distance (metres) between the agent's approach point and the
+# object. The approach point is placed this far back from the object along the
+# navigable viewing side; the pathfinder then snaps it onto the navmesh. Kept
+# small so the agent actually closes in on the target instead of stopping at a
+# comfortable viewing distance.
+DESIRED_STANDOFF = 0.7
+
 # Local copies of utility functions to avoid circular imports
 def _bbox_iou(a, b) -> float:
     if a is None or b is None:
@@ -503,23 +510,50 @@ class ObjectMemoryPool:
 
     # ── anchor / approach ───────────────────────────────────────────
 
-    def compute_best_approach(self, object_node_id: str) -> np.ndarray:
+    def compute_best_approach(
+        self, object_node_id: str, desired_stop: float = DESIRED_STANDOFF,
+    ) -> np.ndarray:
+        """Approach point = a small stand-off back from the object.
+
+        The object node position is the estimated object location. We take the
+        closest observation waypoint as a known-navigable reference on the
+        viewing side, then place the approach point ``desired_stop`` metres back
+        from the object toward that reference. The pathfinder snaps this onto the
+        navmesh at probe time, so the agent ends up right next to the object
+        instead of stopping at the original (far) viewing pose.
+        """
         node = self._map.get_node(object_node_id)
         if node is None:
             return np.zeros(3, dtype=np.float32)
-        obj_pos = node.position
-        viewpoint_ids = node.attributes.get("viewpoints", [])
-        best_pos = obj_pos.copy()
+        obj_pos = np.asarray(node.position, dtype=np.float32)
+
+        # Nearest observation waypoint = navigable reference on the viewing side.
+        viewer_pos = None
         best_dist = float("inf")
-        for vp_id in viewpoint_ids:
+        for vp_id in node.attributes.get("viewpoints", []):
             vp = self._map.get_node(vp_id)
             if vp is None:
                 continue
             d = float(np.linalg.norm(vp.position - obj_pos))
             if d < best_dist:
                 best_dist = d
-                best_pos = vp.position.copy()
-        return best_pos
+                viewer_pos = np.asarray(vp.position, dtype=np.float32).copy()
+
+        if viewer_pos is None:
+            # No known viewer: hand the object position to the pathfinder, which
+            # will snap it to the nearest navmesh point.
+            return obj_pos.copy()
+
+        delta = viewer_pos - obj_pos
+        dist = float(np.linalg.norm(delta))
+        if dist <= desired_stop or dist < 1e-6:
+            # Viewer already inside the stand-off band; stand where we observed.
+            return viewer_pos.astype(np.float32)
+
+        standoff = obj_pos + (delta / dist) * desired_stop
+        # Keep the floor height from a known navigable pose for a clean snap.
+        standoff[1] = viewer_pos[1]
+        return standoff.astype(np.float32)
 
     def _compute_best_approach(self, object_node_id: str) -> np.ndarray:
         return self.compute_best_approach(object_node_id)

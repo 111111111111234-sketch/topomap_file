@@ -11,15 +11,26 @@ flow with explicit structure and navigation stages.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+import math
+from collections import deque
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from conftopo.agents.base_agent import ConfTopoBaseAgent
 from conftopo.agents.goat_agent1_active_topo import ActiveTopoProjector
 from conftopo.agents.goat_agent1_control import StateMachine
-from conftopo.agents.goat_agent1_memory import Agent1MemoryWriter
-from conftopo.agents.goat_agent1_planner import NavigationPlanner, StructurePlanner
+from conftopo.agents.goat_agent1_memory import (
+    Agent1MemoryWriter,
+    GoalRelevanceScorer,
+)
+from conftopo.agents.goat_agent1_planner import (
+    NavigationPlanner,
+    StructurePlanner,
+    _goal_id,
+    hypothesis_c_task,
+    object_c_task,
+)
 from conftopo.agents.goat_agent1_types import (
     ActiveTopoView,
     AgentPose,
@@ -30,6 +41,7 @@ from conftopo.agents.goat_agent1_types import (
     ProjectionConfig,
     RecoveryState,
     ScanContext,
+    SearchIntent,
 )
 from conftopo.config import ConfTopoConfig
 from conftopo.core.dynamic_topo_map import NodeType
@@ -42,6 +54,45 @@ from conftopo.perception.vlm_perceiver import VLMPerceiver
 
 
 NAV_REACH_RADIUS = 0.40
+
+# Scale-fair arrival detection: the agent has physically reached / been blocked
+# by the target when it keeps trying to move forward but its own pose stops
+# advancing. This replaces object-size-dependent bbox proximity heuristics.
+ARRIVAL_STALL_WINDOW = 4      # steps of pose history to inspect
+ARRIVAL_STALL_EPS = 0.30      # meters: max horizontal spread that counts as stalled
+ARRIVAL_MIN_FORWARD = 2       # min forward attempts in the window (not just turning)
+
+# Minimum label relevance for treating a memory object as THE goal (for the
+# metric arrival / commit gates). Kept strict (> alias-synonym score of 0.80) so
+# semantic cousins -- e.g. a "shelf"/"bookcase" for goal "rack" -- do not trigger
+# an early stop when the real target is still far away. Exact matches (1.0) and
+# direct variants like "wooden rack"/"clothes rack" (0.85, contain the goal word)
+# still qualify.
+GOAL_MATCH_MIN_RELEVANCE = 0.85
+
+# --- Sticky local commitment (exploit) --------------------------------------
+# When a goal-relevant object's task-conditioned confidence c_task clears this
+# bar, the agent LOCKS navigation onto its approach point and holds the lock
+# across frames (even when the object is momentarily out of view), so per-frame
+# hypotheses cannot hijack the target and spin the agent in place. Uncertain
+# candidates (below the bar) still compete normally against exploration via
+# c_task, preserving the explore/exploit arbitration.
+LOCK_CTASK_THRESHOLD = 0.7
+
+# While navigating (SEARCH) toward a locked candidate's OBSERVATION anchor, if
+# the agent makes no measurable progress (its min horizontal distance to that
+# anchor stops improving) for this many planning steps -- and the goal is not
+# being actively servoed to (not seen recently) -- the detection is treated as
+# unreachable / mislocalised / false: it is demoted (cooldown + decay) and the
+# lock released so exploration resumes. This is the "can't push in" release that
+# was missing, and prevents a single bad detection from pinning the whole
+# episode. plan() early-returns during CONFIRM, so a genuine goal being visually
+# approached never accumulates this count.
+LOCK_NO_PROGRESS_STEPS = 15
+
+# A demoted goal object is excluded from goal candidates for this many steps
+# (a cooldown, not a permanent removal) and has its existence confidence decayed.
+OBJECT_SEARCH_COOLDOWN = 60
 
 
 def _normalize_embedding(value: Any) -> Optional[np.ndarray]:
@@ -330,6 +381,8 @@ class GOATAgent(ConfTopoBaseAgent):
         self.state_machine = StateMachine()
         self.step_id = 0
         self._pose: Optional[AgentPose] = None
+        self._recent_positions: Deque[Tuple[float, float]] = deque(maxlen=ARRIVAL_STALL_WINDOW)
+        self._recent_forward: Deque[bool] = deque(maxlen=ARRIVAL_STALL_WINDOW)
         self._rgb: Optional[np.ndarray] = None
         self._rgb_embed: Optional[np.ndarray] = None
         self._clip_report = PerceptionReport()
@@ -338,6 +391,9 @@ class GOATAgent(ConfTopoBaseAgent):
         self._last_nav_target = NavigationTarget(None, None)
         self._sticky_nav_target = NavigationTarget(None, None)
         self._sticky_nav_steps = 0
+        self._locked_object_id: Optional[str] = None
+        self._lock_best_dist: Optional[float] = None
+        self._lock_stall_steps = 0
         self._pathfinder = None
         self._nav_sim = None
         self._nav_origin_world: Optional[np.ndarray] = None
@@ -386,9 +442,14 @@ class GOATAgent(ConfTopoBaseAgent):
         self._last_needs_verify = False
         self.state_machine = StateMachine()
         self.step_id = 0
+        self._recent_positions.clear()
+        self._recent_forward.clear()
         self._last_nav_target = NavigationTarget(None, None)
         self._sticky_nav_target = NavigationTarget(None, None)
         self._sticky_nav_steps = 0
+        self._locked_object_id = None
+        self._lock_best_dist = None
+        self._lock_stall_steps = 0
         self._nav_history = []
         self._target_progress = {}
         self._stale_target_until_step = {}
@@ -475,6 +536,8 @@ class GOATAgent(ConfTopoBaseAgent):
         self.goal_manager.set_goal(goal)
         self.perception.configure_goal(goal)
         self.state_machine.reset_for_goal()
+        self._recent_positions.clear()
+        self._recent_forward.clear()
         self._active_view = ActiveTopoView()
         self._recovery.reset()
         self._active_view_signature = None
@@ -577,11 +640,6 @@ class GOATAgent(ConfTopoBaseAgent):
             allow_frontier_generation=not self._scan_context.active(),
         )
 
-    def _active_goal_id(self, goal: Optional[GoalNode]) -> Optional[str]:
-        if goal is None:
-            return None
-        return str(goal.image_cache_key or goal.goal_image_id or goal.target_object)
-
     RECOVERY_BUDGET = 20
     RECOVERY_PROGRESS_RADIUS = 1.5
 
@@ -625,7 +683,7 @@ class GOATAgent(ConfTopoBaseAgent):
         """
         goal = self.goal_manager.current_goal()
         signature = (
-            self._active_goal_id(goal),
+            _goal_id(goal),
             len(self.topo_map.structure_layer.nodes()),
             len(self.topo_map.navigation_layer.nodes()),
             self._recovery.level,
@@ -638,7 +696,7 @@ class GOATAgent(ConfTopoBaseAgent):
             pose=self._pose,
             recovery_level=self._recovery.level,
             prev_view=self._active_view,
-            goal_id=self._active_goal_id(goal),
+            goal_id=_goal_id(goal),
             step_id=self.step_id,
         )
         self._active_view_signature = signature
@@ -658,14 +716,14 @@ class GOATAgent(ConfTopoBaseAgent):
             return self._last_nav_target
         if self._scan_context.active():
             planning_context = self._build_planning_context()
-            anchor = (
-                self.topo_map.get_node(str(self._scan_context.anchor_node_id))
-                if self._scan_context.anchor_node_id
-                else None
-            )
+            # No position on a scan target: the scan is a pure in-place look-around
+            # (handled by _scan_step -> _scan_sweep_action). Leaving position None
+            # guarantees that even if the sweep is ever bypassed the executor turns
+            # in place rather than re-navigating onto the already-reached anchor
+            # (the v20 "target_reached" no-op spin).
             target = NavigationTarget(
                 node_id=self._scan_context.anchor_node_id,
-                position=None if anchor is None else anchor.position.copy(),
+                position=None,
                 target_type=self._scan_context.scan_type,
                 reason=f"scan_active:{self._scan_context.scan_type}",
                 structure_node_id=self._scan_context.structure_node_id,
@@ -676,6 +734,14 @@ class GOATAgent(ConfTopoBaseAgent):
         self._update_navigation_progress()
         planning_context = self._build_planning_context()
         goal = self.goal_manager.current_goal()
+        committed = self._goal_object_commit_target(goal, planning_context)
+        if committed is not None:
+            committed = self._stabilize_navigation_target(committed, planning_context)
+            self._last_intent = committed.source_intent
+            self._last_nav_target = committed
+            self._last_planning_context = planning_context
+            self._record_navigation_selection(committed)
+            return committed
         intents = self.structure_planner.build_intents(
             topo_map=self.topo_map,
             hypotheses=self.memory.hypothesis_pool,
@@ -708,11 +774,15 @@ class GOATAgent(ConfTopoBaseAgent):
         if self._pose is None:
             return target
         sticky = self._sticky_nav_target
+        sticky_intent = sticky.source_intent.intent_type if sticky.source_intent else None
+        # Commit longer to an exploration frontier so we actually reach it instead
+        # of re-picking among the ~5 near-equivalent local frontiers every step
+        # (which manifests as circling in place).
+        sticky_cap = 26 if sticky_intent in ("explore", "hypothesis") else 18
         keep = False
-        if sticky.node_id and sticky.position is not None and self._sticky_nav_steps < 18:
+        if sticky.node_id and sticky.position is not None and self._sticky_nav_steps < sticky_cap:
             node = self.topo_map.get_node(str(sticky.node_id))
             dist = float(np.linalg.norm(sticky.position - self._pose.position))
-            sticky_intent = sticky.source_intent.intent_type if sticky.source_intent else None
             new_intent = target.source_intent.intent_type if target.source_intent else None
             stale = bool(planning_context and sticky.node_id in planning_context.stale_target_ids)
             same_task = (
@@ -882,18 +952,24 @@ class GOATAgent(ConfTopoBaseAgent):
         self._force_vlm_scan_steps = max(self._force_vlm_scan_steps, int(steps))
         self._visual_scan_steps = max(self._visual_scan_steps, int(steps))
 
-    def _scan_should_override(self) -> bool:
+    def _scan_step(self, target: NavigationTarget) -> Optional[Dict[str, Any]]:
+        """Return the next look-around sweep action, or None if no scan is active.
+
+        Self-terminating: `_scan_sweep_action` decrements the remaining steps and
+        finishes the scan at 0, so an active scan always emits a real turn and
+        ends within `remaining_steps` frames. Aborts early (returns None) if the
+        goal became visible or control took over (CONFIRM/STOP)."""
         if not self._scan_context.active():
-            return False
+            return None
         if self._vlm_report is not None and bool(self._vlm_report.goal_visible):
             self._scan_context = ScanContext()
             self._visual_scan_steps = 0
-            return False
+            return None
         if self.state_machine.state.mode.value in {"CONFIRM", "STOP"}:
             self._scan_context = ScanContext()
             self._visual_scan_steps = 0
-            return False
-        return True
+            return None
+        return self._scan_sweep_action(target)
 
     def _scan_sweep_action(self, target: NavigationTarget) -> Dict[str, Any]:
         total = 8
@@ -944,6 +1020,15 @@ class GOATAgent(ConfTopoBaseAgent):
                     node.attributes["failed_count"] = int(node.attributes.get("failed_count", 0) or 0) + 1
                     node.attributes["last_failed_step"] = self.topo_map.current_step
                     node.attributes["failure_reason"] = f"{ctx.scan_type}_no_visual_confirmation"
+                    # Arriving at the observation anchor and sweeping without ever
+                    # re-acquiring the goal strongly implies the detection was
+                    # mislocalised: demote the object (cooldown + decay) and drop
+                    # any lock so the agent stops re-committing to it and resumes
+                    # exploration instead of parking on the dead anchor.
+                    if ctx.scan_type == "object_anchor":
+                        self._demote_goal_object(node)
+                        if str(self._locked_object_id or "") == str(structure_id):
+                            self._release_object_lock()
             if anchor_id:
                 self._stale_target_until_step[str(anchor_id)] = int(self.step_id + 20)
             self._record_history_entry(
@@ -957,7 +1042,315 @@ class GOATAgent(ConfTopoBaseAgent):
         ctx.failure_recorded = True
         self._scan_context = ScanContext()
 
+    def _record_pose_for_arrival(self) -> None:
+        if self._pose is not None:
+            pos = self._pose.position
+            self._recent_positions.append((float(pos[0]), float(pos[2])))
+
+    def _compute_arrived(self) -> bool:
+        """Scale-fair arrival: recent forward attempts but pose stopped advancing.
+
+        Object-size independent (unlike absolute bbox area/height): it keys on the
+        agent's own quantized pose no longer moving despite trying to advance. The
+        bbox ground-contact corroboration lives in the StopVerifier.
+        """
+        if len(self._recent_positions) < ARRIVAL_STALL_WINDOW:
+            return False
+        if sum(1 for f in self._recent_forward if f) < ARRIVAL_MIN_FORWARD:
+            return False
+        pts = list(self._recent_positions)
+        spread = max(
+            math.dist(pts[i], pts[j])
+            for i in range(len(pts))
+            for j in range(i + 1, len(pts))
+        )
+        return spread < ARRIVAL_STALL_EPS
+
+    def _goal_relevant_objects(self, goal: Optional[GoalNode]) -> List[Any]:
+        """Goal-relevant, non-folded OBJECT nodes in memory.
+
+        Relevance is recomputed against the CURRENT goal (stored target_relevance
+        is frozen at creation and would leak across GOAT goals).
+        """
+        out: List[Any] = []
+        if goal is None:
+            return out
+        for node in self.topo_map.object_memory.get_all():
+            if node.attributes.get("folded") or node.attributes.get("blocked"):
+                continue
+            if node.position is None:
+                continue
+            # Skip candidates demoted after an unconfirmable visit (cooldown).
+            cooldown = int(node.attributes.get("goal_search_cooldown_until", -1) or -1)
+            if cooldown >= int(self.step_id):
+                continue
+            if GoalRelevanceScorer.label_relevance(node.label, goal) < GOAL_MATCH_MIN_RELEVANCE:
+                continue
+            out.append(node)
+        return out
+
+    def _horizontal_distance(self, pos) -> float:
+        return math.hypot(
+            float(pos[0] - self._pose.position[0]),
+            float(pos[2] - self._pose.position[2]),
+        )
+
+    def _release_object_lock(self) -> None:
+        self._locked_object_id = None
+        self._lock_best_dist = None
+        self._lock_stall_steps = 0
+
+    def _observation_anchor(self, node: Any) -> Optional[Any]:
+        """Return the real waypoint the object was OBSERVED from (a reachable,
+        already-visited pose), NOT the estimated stand-off approach point.
+
+        Navigating to where we actually saw the object -- then closing the last
+        gap with the live visual servo (CONFIRM) -- avoids trusting the monocular
+        position estimate for path planning. Falls back to the generic structure
+        anchor (which may include the approach point) only if no usable observed
+        waypoint exists."""
+        attrs = node.attributes
+        bad = {str(x) for x in attrs.get("bad_anchor_waypoint_ids", []) or []}
+        cand_ids: List[str] = []
+        best = attrs.get("best_anchor_waypoint_id")
+        if best:
+            cand_ids.append(str(best))
+        observed = attrs.get("observed_from_waypoint_ids")
+        if isinstance(observed, list):
+            cand_ids.extend(str(x) for x in reversed(observed))
+        anchor = attrs.get("anchor_waypoint_id")
+        if anchor:
+            cand_ids.append(str(anchor))
+        for cid in cand_ids:
+            if cid in bad:
+                continue
+            c = self.topo_map.get_node(cid)
+            if (
+                c is not None
+                and c.node_type in self.topo_map._NAV_NODE_TYPES
+                and not c.attributes.get("blocked", False)
+            ):
+                return c
+        return self.topo_map.navigation_target_for_structure_node(node.node_id)
+
+    def _closer_object_anchor(self, node: Any, observation_anchor: Any) -> Optional[Any]:
+        """The object's stand-off approach point (a navmesh pose set back from the
+        estimated object position). Used ONLY after the trusted observation
+        waypoint has been reached, so we keep edging closer for a confirming view
+        instead of idling at the reached waypoint. If it is unreachable/bad the
+        progress-based lock release will demote the candidate."""
+        ap_id = node.attributes.get("approach_point_id")
+        if not ap_id or str(ap_id) == str(observation_anchor.node_id):
+            return None
+        bad = {str(x) for x in node.attributes.get("bad_anchor_waypoint_ids", []) or []}
+        if str(ap_id) in bad:
+            return None
+        ap = self.topo_map.get_node(str(ap_id))
+        if (
+            ap is None
+            or ap.node_type not in self.topo_map._NAV_NODE_TYPES
+            or ap.attributes.get("blocked", False)
+            or ap.attributes.get("consumed", False)
+        ):
+            return None
+        return ap
+
+    def _demote_goal_object(self, node: Any) -> None:
+        """General negative evidence: we reached this candidate but could not
+        confirm it as the goal, so exclude it from goal candidates for a cooldown
+        and decay its existence confidence. Not object/goal specific and not
+        permanent -- after the cooldown it can be reconsidered."""
+        node.attributes["goal_search_cooldown_until"] = int(self.step_id) + OBJECT_SEARCH_COOLDOWN
+        node.confidence = max(0.0, float(node.confidence) * 0.5)
+
+    def _lock_candidates(self, goal: GoalNode) -> List[Dict[str, Any]]:
+        """Unified lock candidates: confirmed goal OBJECTS and goal HYPOTHESES,
+        each scored by the same task-conditioned confidence. Only candidates
+        clearing ``LOCK_CTASK_THRESHOLD`` are eligible for the sticky lock."""
+        cands: List[Dict[str, Any]] = []
+        for node in self._goal_relevant_objects(goal):
+            ct = object_c_task(node, goal)
+            if ct >= LOCK_CTASK_THRESHOLD:
+                cands.append({"kind": "object", "key": node.node_id,
+                              "pos": node.position, "c_task": ct, "node": node})
+        pool = getattr(self.memory, "hypothesis_pool", None)
+        if pool is not None:
+            gid = _goal_id(goal)
+            for hyp in pool.get_active(goal_id=gid, include_needs_verify=True):
+                if hyp.anchor_node_id is None:
+                    continue
+                anchor = self.topo_map.get_node(hyp.anchor_node_id)
+                if anchor is None:
+                    continue
+                ct = hypothesis_c_task(hyp, goal)
+                if ct >= LOCK_CTASK_THRESHOLD:
+                    cands.append({"kind": "hypothesis", "key": f"hyp:{hyp.id}",
+                                  "pos": anchor.position, "c_task": ct,
+                                  "hyp": hyp, "anchor": anchor})
+        return cands
+
+    def _demote_candidate(self, cand: Dict[str, Any]) -> None:
+        if cand["kind"] == "object":
+            self._demote_goal_object(cand["node"])
+            return
+        pool = getattr(self.memory, "hypothesis_pool", None)
+        if pool is not None:
+            try:
+                pool.reject(cand["hyp"].id, "search_exhausted")
+            except Exception:
+                pass
+
+    def _commit_intent_for(self, cand: Dict[str, Any]) -> Optional[SearchIntent]:
+        if cand["kind"] == "object":
+            node = cand["node"]
+            nav = self._observation_anchor(node)
+            if nav is None:
+                return None
+            # Fix 3: don't freeze the target at the reached observation waypoint.
+            # Once we're essentially standing at the (trusted) observed pose but
+            # still haven't confirmed the object, retarget to a closer stand-off
+            # approach point so navigation keeps pulling us in for a better view
+            # rather than idling. Until the observed pose is reached we keep the
+            # observation waypoint (avoids trusting the position estimate early).
+            anchor = nav
+            if self._pose is not None and self._horizontal_distance(nav.position) <= NAV_REACH_RADIUS * 2.5:
+                closer = self._closer_object_anchor(node, nav)
+                if closer is not None:
+                    anchor = closer
+            return SearchIntent(
+                intent_type="object",
+                target_label=node.label,
+                structure_node_id=node.node_id,
+                preferred_anchor_waypoint_id=anchor.node_id,
+                target_position=anchor.position.copy(),
+                score=10.0,
+                reason=(
+                    f"commit_locked_object:{node.node_id}; anchor={anchor.node_id}; "
+                    f"c_task={cand['c_task']:.2f}; stall={self._lock_stall_steps}"
+                ),
+                preferred_room=node.attributes.get("room_label"),
+                evidence_refs=[node.node_id],
+            )
+        hyp = cand["hyp"]
+        anchor = cand["anchor"]
+        return SearchIntent(
+            intent_type="hypothesis",
+            target_label=hyp.label,
+            preferred_anchor_waypoint_id=anchor.node_id,
+            target_position=anchor.position.copy(),
+            score=10.0,
+            reason=(
+                f"commit_locked_hypothesis:{hyp.id}; "
+                f"c_task={cand['c_task']:.2f}; stall={self._lock_stall_steps}"
+            ),
+            evidence_refs=[hyp.id],
+        )
+
+    def _goal_object_commit_target(
+        self,
+        goal: Optional[GoalNode],
+        planning_context: Optional[PlanningContext],
+    ) -> Optional[NavigationTarget]:
+        """Sticky local commitment to a confident goal candidate (general exploit).
+
+        A candidate is either a confirmed goal OBJECT or a goal HYPOTHESIS whose
+        task-conditioned confidence ``c_task`` clears ``LOCK_CTASK_THRESHOLD``.
+        The agent LOCKS navigation onto the candidate's OBSERVATION anchor (the
+        real waypoint it was seen from, not the estimated stand-off) and holds the
+        lock across frames -- regardless of per-frame visibility -- so competing
+        objects / hypotheses / frontiers cannot hijack the target and spin the
+        agent in place. Confirmed objects take priority over hypotheses; among
+        objects the nearest wins, among hypotheses the most confident. The last
+        gap is then closed by the CONFIRM visual servo (walk toward the live
+        bbox, correct each frame). If the agent cannot make progress toward the
+        observation anchor for LOCK_NO_PROGRESS_STEPS while the goal is not being
+        actively servoed to (mislocalised / unreachable / false detection), the
+        candidate is demoted (object -> cooldown+decay, hypothesis -> reject) and
+        the lock released so exploration resumes. Uncertain candidates below the
+        bar fall through to normal intent competition, where c_task still
+        arbitrates explore/exploit.
+        """
+        if goal is None or self._pose is None:
+            self._release_object_lock()
+            return None
+        cands = self._lock_candidates(goal)
+        if not cands:
+            self._release_object_lock()
+            return None
+        locked = None
+        if self._locked_object_id is not None:
+            locked = next((c for c in cands if c["key"] == self._locked_object_id), None)
+        if locked is None:
+            objs = [c for c in cands if c["kind"] == "object"]
+            if objs:
+                locked = min(objs, key=lambda c: self._horizontal_distance(c["pos"]))
+            else:
+                locked = max(cands, key=lambda c: c["c_task"])
+            self._locked_object_id = locked["key"]
+            self._lock_best_dist = None
+            self._lock_stall_steps = 0
+        intent = self._commit_intent_for(locked)
+        if intent is None:
+            self._demote_candidate(locked)
+            self._release_object_lock()
+            return None
+        # Progress-based exhaustion (observation-driven, not estimate-driven):
+        # measure the agent's horizontal distance to the OBSERVATION anchor we are
+        # navigating to. If we keep improving, hold the lock. If the goal was seen
+        # recently we're actively servoing to it (CONFIRM), so never count that as
+        # stalled. Otherwise, if the distance stops improving for
+        # LOCK_NO_PROGRESS_STEPS, the anchor is unreachable / the detection is
+        # false -> demote and resume exploration.
+        last_seen = int(self.state_machine.state.last_goal_seen_step)
+        seen_recently = last_seen >= 0 and int(self.step_id) - last_seen <= 5
+        anchor_pos = intent.target_position
+        d = self._horizontal_distance(anchor_pos) if anchor_pos is not None else float("inf")
+        if seen_recently or self._lock_best_dist is None or d < self._lock_best_dist - 0.15:
+            self._lock_best_dist = d
+            self._lock_stall_steps = 0
+        else:
+            self._lock_stall_steps += 1
+            if self._lock_stall_steps >= LOCK_NO_PROGRESS_STEPS:
+                self._demote_candidate(locked)
+                self._release_object_lock()
+                return None
+        target = self.navigation_planner.select_from_intents(
+            topo_map=self.topo_map,
+            intents=[intent],
+            pose=self._pose,
+            planning_context=planning_context,
+            active_view=self._active_view,
+        )
+        if target.node_id is not None:
+            return target
+        # No navigable route to the locked candidate right now -> drop it for a
+        # cooldown / reject so we don't keep re-selecting an unreachable one.
+        self._demote_candidate(locked)
+        self._release_object_lock()
+        return None
+
     def act(self, plan_output: NavigationTarget) -> Dict[str, Any]:
+        self._record_pose_for_arrival()
+        # Deliberate look-around scan handled FIRST and self-terminating: it
+        # decrements every step it is active and finishes at 0, so it can never
+        # deadlock the agent parked on an already-reached anchor (the v20 rack
+        # sat 60 steps "scan_active" but never actually turned). Running it before
+        # the state machine also means no downstream transition can shadow it.
+        scan_action = self._scan_step(plan_output)
+        if scan_action is not None:
+            self._recent_forward.append(False)
+            scan_action["debug"] = self._debug_snapshot()
+            scan_action.setdefault("target_node_id", plan_output.node_id)
+            scan_action.setdefault("target_type", plan_output.target_type)
+            return scan_action
+        # Observation-based arrival: the agent kept trying to move forward toward
+        # the (visible, centered) goal but its own pose stopped advancing -- it is
+        # physically as close as the navmesh allows. This is decided from actual
+        # motion, NOT from the estimated object position, so a mislocalised object
+        # node no longer dictates where we stop. The STOP gate still requires the
+        # goal to be visible + semantically relevant (see StopVerifier), so a
+        # pose-stall while merely blocked far from the target never stops.
+        arrived = self._compute_arrived()
         control_report = self._vlm_report
         fresh_report = self._vlm_report is not None and self._vlm_report.is_full
         if control_report is None and self._last_valid_vlm_report is not None:
@@ -995,9 +1388,15 @@ class GOATAgent(ConfTopoBaseAgent):
             needs_verify=needs_verify,
             on_verify_success=_on_verify_success,
             on_verify_failure=_on_verify_failure,
+            arrived=arrived,
         )
-        if self._scan_should_override():
-            action = self._scan_sweep_action(plan_output)
+        # (Scan sweep is handled at the top of act() now; see _scan_step.)
+        # Arrival = "kept trying to step FORWARD but pose stopped advancing" (i.e.
+        # blocked right at the target). Only genuine forward low-actions may count:
+        # a `navigate` intent or an in-place `turn_*` must NOT, otherwise merely
+        # spinning to centre at an already-reached waypoint reads as arrival (the
+        # v18 rack regression stopped ~3 m short exactly this way).
+        self._recent_forward.append(str(action.get("action", "")) == "move_forward")
         action["debug"] = self._debug_snapshot()
         if "target_node_id" not in action:
             action["target_node_id"] = plan_output.node_id
@@ -1026,12 +1425,12 @@ class GOATAgent(ConfTopoBaseAgent):
                 node.attributes["visit_count"] = int(node.attributes.get("visit_count", 0) or 0) + 1
                 node.attributes["last_reached_step"] = self.topo_map.current_step
                 if node.node_type in (NodeType.WAYPOINT_FRONTIER, NodeType.WAYPOINT_CANDIDATE):
-                    self._start_scan(
-                        "frontier",
-                        anchor_node_id=node.node_id,
-                        structure_node_id=target.structure_node_id,
-                        steps=8,
-                    )
+                    # No turn-sweep at plain frontiers: they are dense (~2.3 m
+                    # apart), so a full 8-step sweep at every hop reads as in-place
+                    # spinning and stalls forward exploration. We already get a
+                    # fresh VLM report each nav step; the sweep is reserved for
+                    # portals / object / region anchors where a deliberate look
+                    # around actually pays off.
                     self.topo_map.promote_frontier_to_visited(node.node_id)
                 elif target.target_type in {"object_anchor", "object_anchor_offset"}:
                     self._start_scan(
@@ -1079,6 +1478,15 @@ class GOATAgent(ConfTopoBaseAgent):
                 obj.attributes["failed_count"] = int(obj.attributes.get("failed_count", 0) or 0) + 1
                 if unreachable:
                     obj.attributes["unreachable_count"] = int(obj.attributes.get("unreachable_count", 0) or 0) + 1
+                # Dead-target circuit breaker: repeated external nav failures on
+                # the same object (harness escalates a reached-but-stuck target to
+                # navigation_failed) mean we keep re-committing to a target we can
+                # neither approach nor confirm. Demote it (cooldown + decay) and
+                # release the lock so exploration resumes instead of spinning.
+                if int(obj.attributes.get("failed_count", 0) or 0) >= 3:
+                    self._demote_goal_object(obj)
+                    if str(self._locked_object_id or "") == str(obj.node_id):
+                        self._release_object_lock()
         if (
             target.target_type == "portal_waypoint"
             and target.source_intent
