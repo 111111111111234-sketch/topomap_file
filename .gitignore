@@ -1,6 +1,7 @@
 # Data / models / checkpoints
 data/
 models/
+clip/
 work_dirs/
 work_dirs_bak/
 *.pth
